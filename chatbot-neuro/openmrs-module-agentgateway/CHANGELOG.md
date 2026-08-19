@@ -1,0 +1,120 @@
+# Changelog — Clinical Agent Gateway (`agentgateway`)
+
+## 1.1.3 — 2026-08-18
+
+Audit-log readability. No behavioural change to the chat, the security model or the schema.
+
+### Fixed
+
+- **The operation log's "Utilisateur" column was blank on every row.** It read
+  `User.getUsername()`, which is null for an account that authenticates by system id — and this
+  installation's own `admin` account is one. The log had recorded who acted; it simply could not say
+  so. Now falls back to the system id, then the uuid, the same order as
+  `DelegatedTokenService.subjectFor` (1.1.1). Same root cause as the 1.1.1 mint failure, surfacing
+  in a second place.
+- **Dates rendered as epoch milliseconds** (`1787072923000`). Formatted server-side as
+  `yyyy-MM-dd HH:mm:ss` in the server's zone. This page exists for an administrator deciding whether
+  to reverse an operation; a number is not a date.
+
+### Note on versioning
+
+The parent POM version is unrelated to this module's version and must not be bumped with it. A
+blanket search-and-replace over `pom.xml` hits both, and because `maven-parent-openmrs-module`
+1.1.1 and 1.1.2 exist upstream, releases 1.1.1 and 1.1.2 were built against a parent that had been
+changed by accident. The build and tests were unaffected, and the parent is pinned back to 1.1.0
+here, with a comment in `pom.xml` so it does not recur.
+
+## 1.1.2 — 2026-08-18
+
+Bugfix release. No schema change, no new privilege, no new global property. **Requires the matching
+agent-service build**: the agent must address calls through the new relay prefix, so deploy both or
+neither.
+
+### Fixed
+
+- **No agent call to `fhir2` could succeed.** `fhir2` registers its own `AuthenticationFilter` on
+  `/ws/fhir2/*`, and since `fhir2` is a bundled module it starts — and so registers that filter —
+  before `agentgateway`. Module filters run in start order inside web.xml's single `ModuleFilter`,
+  so fhir2 answered **401** before this module could authenticate the delegated clinician. The only
+  FHIR path that worked was `/metadata`, which fhir2 exempts.
+
+  Agent calls now arrive at `/module/agentgateway/relay` + the real path — a path fhir2 does not
+  guard. The audit filter authenticates the clinician there and **forwards** to the real servlet.
+  Module filters are not mapped for `FORWARD`, so fhir2's gate is not consulted again, while the
+  real fhir2 servlet still serves the request and every OpenMRS privilege check still runs as that
+  clinician.
+
+  `/ws/fhir2/R4/...` is rewritten to `/ms/fhir2Servlet/...` on the forward, because fhir2's own
+  `ForwardingFilter` normally does that rewrite and is itself skipped. `/ws/rest/v1/...` needs no
+  rewrite — web.xml maps `/ws/*` to OpenMRS's DispatcherServlet, and servlet mappings do apply to a
+  forward.
+
+- **Before-state capture and rollback were broken the same way.** `DelegatedApiCaller` reaches
+  OpenMRS over HTTP for both, so its calls hit the same 401. It now uses the relay prefix too. This
+  would have surfaced as silently non-reversible writes (CA9) and failing rollbacks (CA10) the
+  moment a write path became reachable.
+
+### Notes for operators
+
+- `OpenmrsFilter` **is** mapped for `FORWARD` and re-reads the user context from the HTTP session,
+  which would have replaced the delegated context mid-forward. The filter therefore seeds the
+  session with the delegated context before forwarding, and invalidates that session afterwards.
+  Each agent call arrives on its own cookie-less connection, so the session is created, used by one
+  request, and destroyed — it is never a session a browser could join. The invalidation is not
+  tidiness: without it, every chat turn leaks a session.
+- This changes a design position. §3 of the architecture states that `agentgateway` verifies and
+  logs in-process rather than proxying that leg. That was only possible if its filter ran before the
+  API's own authentication, which on this platform it cannot. The property that matters — every call
+  runs under the clinician's own privileges, never a service account (CA7, ADR-9) — is unchanged.
+
+## 1.1.1 — 2026-08-18
+
+Bugfix release. No schema change, no new privilege, no new global property, no API change. A
+1.1.0 deployment can be replaced in place: copy the `.omod` in, remove the old one, restart
+OpenMRS.
+
+### Fixed
+
+- **The chat could not relay a turn for any account without a username.** Delegated tokens were
+  minted from `User.getUsername()` alone, so every turn from such an account failed with
+  `TokenException: Cannot mint a delegated token without a username` and never reached the agent
+  service.
+
+  OpenMRS does not require a username — an account may authenticate by `system_id` alone, which is
+  what the Reference Application's user-creation flow produces. The subject is now the username,
+  falling back to the system id, and an account with neither produces an error that names the
+  account instead of a bare "without a username".
+
+  This affected all three places a token is minted: a chat turn, an administrator's rollback, and
+  the module's own read-only before-state call.
+
+### Changed
+
+- **A delegated token's user is now resolved by uuid, not by name.**
+  `DelegatedAuthenticationScheme` looks the user up with `ContextDAO.getUserByUuid` using the
+  `user_uuid` claim the token already carried, falling back to the subject when that claim is
+  absent (as in tokens minted by 1.1.0).
+
+  This is not a change in what is trusted — both values arrive inside the same signed token. It
+  means the subject stays a human-readable label for the audit trail and never has to be
+  interpreted as one kind of identifier or the other, which also removes the question of what
+  should happen if a username and a system id collide across two accounts.
+
+### Added
+
+- `DelegatedSubjectTest` — 6 tests pinning the subject fallback, the refusal when an account has
+  neither identifier, and the uuid/subject pair surviving into `DelegatedCredentials`.
+
+### Notes for operators
+
+- `agentgateway.signingPrivateKey` is written to the Tomcat log in cleartext whenever it is saved,
+  because OpenMRS's `LoggingAdvice` logs every global-property save with its value. That is
+  platform behaviour, not this module's. Treat `docker logs openmrs-app` as holding a credential.
+- The audit log contains PHI by design — the prompt and the data it produced are the only way an
+  administrator can review or reverse an operation.
+
+## 1.1.0
+
+Initial delivery of Phase 2: chat relay, delegated-token minting and verification, the audit
+filter, `agentgateway_operation_log`, and admin review and rollback. Built and tested against a
+mock OpenMRS; never exercised against the live instance.

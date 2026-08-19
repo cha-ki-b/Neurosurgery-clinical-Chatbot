@@ -1,0 +1,4 @@
+# Real configuration and key material never belong in the repository.
+.env
+certs/
+!certs/.gitkeep

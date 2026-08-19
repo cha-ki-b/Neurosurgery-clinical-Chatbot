@@ -1,0 +1,13 @@
+org\openmrs\module\agentgateway\page\controller\ChatPageController.class
+org\openmrs\module\agentgateway\fragment\controller\ChatWidgetFragmentController.class
+org\openmrs\module\agentgateway\web\controller\ChatRelayController.class
+org\openmrs\module\agentgateway\page\controller\OperationLogPageController.class
+org\openmrs\module\agentgateway\web\controller\AgentGatewayExceptionHandler.class
+org\openmrs\module\agentgateway\web\filter\AgentAuditFilter$1.class
+org\openmrs\module\agentgateway\web\filter\AgentAuditFilter.class
+org\openmrs\module\agentgateway\web\controller\SigningKeyController.class
+org\openmrs\module\agentgateway\web\filter\BufferedRequestWrapper.class
+org\openmrs\module\agentgateway\web\filter\BufferedRequestWrapper$1.class
+org\openmrs\module\agentgateway\web\filter\CapturingResponseWrapper$1.class
+org\openmrs\module\agentgateway\web\filter\CapturingResponseWrapper.class
+org\openmrs\module\agentgateway\web\controller\AgentLogController.class

@@ -1,0 +1,93 @@
+# Server 2 (GPU host) - base stack: TLS reverse proxy + the Clinical Agent Service.
+#
+# Nginx is the ONLY container that publishes a port. Everything else lives on the private
+# docker network and is reachable only through it. That is not a style preference: if the agent
+# published 8000 itself, the proxy would be optional - anything that could reach the host could
+# skip TLS, skip the IP allowlist and skip the rate limit by talking to the raw port.
+#
+#   docker compose up -d
+#
+# This stack serves exactly one thing: the Clinical Agent Service. The DICOM viewer deliberately
+# does not live here - it belongs on Server 1 next to Orthanc, where it needs no cross-origin hop.
+#
+# Adding another service later is two files: a compose overlay (docker-compose.<service>.yml) and
+# one vhost template in nginx/templates-<service>/. Nothing in this file changes. See the README.
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: server2-proxy
+    restart: unless-stopped
+    ports:
+      - "${HTTPS_PORT:-443}:443"
+      - "${HTTP_PORT:-80}:80"
+    environment:
+      # The official image runs envsubst over /etc/nginx/templates/*.template into conf.d/.
+      # The filter keeps it to our own variables, so nginx's own $host, $remote_addr and friends
+      # are left untouched - without it, an unrelated environment variable could blank one out.
+      NGINX_ENVSUBST_FILTER: "^(AGENT_|OPENMRS_)"
+      AGENT_SERVER_NAME: ${AGENT_SERVER_NAME:?set AGENT_SERVER_NAME, e.g. agent.hospital.lan}
+      OPENMRS_SERVER_CIDR: ${OPENMRS_SERVER_CIDR:?set OPENMRS_SERVER_CIDR, e.g. 10.0.211.249/32}
+      AGENT_PROXY_READ_TIMEOUT: ${AGENT_PROXY_READ_TIMEOUT:-60s}
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/snippets:/etc/nginx/snippets:ro
+      - ./nginx/templates/agent.conf.template:/etc/nginx/templates/agent.conf.template:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      clinical-agent:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - server2_net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  clinical-agent:
+    build:
+      context: ../chatbot-neuro/clinical-agent-service
+    image: chu-blida/clinical-agent:1.0.0
+    container_name: clinical-agent
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # openmrs.hospital.lan is signed by hospitalCA, which no public trust store knows about.
+      # Pointing the agent at that authority keeps verification ON; the alternative
+      # (OPENMRS_VERIFY_TLS=false) is encryption with no idea who is on the other end.
+      OPENMRS_CA_BUNDLE: /etc/ssl/hospital/hospitalCA.crt
+    volumes:
+      # The whole directory, not ./certs/hospitalCA.crt on its own. Docker's single-file bind
+      # mount has a trap: if the host path does not exist when the container is created, Docker
+      # silently creates an empty *directory* there - and a later "scp file certs/" then drops
+      # the certificate INSIDE it, as certs/hospitalCA.crt/hospitalCA.crt. The container then
+      # sees a directory where it expected a certificate and crash-loops as "unhealthy", with
+      # nothing on the host looking obviously wrong. Mounting the directory removes the trap:
+      # the certificate can be copied in at any time, before or after the container exists.
+      - ./certs:/etc/ssl/hospital:ro
+    # Deliberately no "ports:". Reachable only from nginx, over server2_net.
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - server2_net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  server2_net:
+    name: server2_net

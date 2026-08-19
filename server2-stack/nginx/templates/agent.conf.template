@@ -1,0 +1,65 @@
+# The Clinical Agent Service - a server-to-server vhost, not a browser-facing one.
+#
+# ADR-12: the browser never talks to this service. If it could, the shared channel secret would
+# have to be reachable from page JavaScript to make the call, which means it would not be a
+# secret - anyone could read it out of devtools and drive the assistant directly, bypassing
+# OpenMRS's session and privilege model entirely.
+#
+# So this vhost is closed to everything except Server 1. That is a third independent layer, on
+# top of the channel secret and the signed delegated token: an attacker needs the network
+# position AND the secret AND a token OpenMRS signed.
+
+server {
+    listen 443 ssl;
+    server_name ${AGENT_SERVER_NAME};
+
+    include /etc/nginx/snippets/tls.conf;
+    include /etc/nginx/snippets/security-headers.conf;
+
+    access_log /var/log/nginx/agent.access.log server2;
+
+    # Only Server 1. Use a /32 for a single host, or a CIDR for a subnet.
+    allow ${OPENMRS_SERVER_CIDR};
+    deny all;
+
+    # A chat turn is a short JSON body. Anything larger is not a conversation.
+    client_max_body_size 64k;
+
+    location = /chat {
+        limit_req zone=agent_chat burst=10 nodelay;
+
+        proxy_pass http://clinical-agent:8000/chat;
+        include /etc/nginx/snippets/proxy.conf;
+
+        # Long enough for the model to answer once Phase 3 lands, short enough that a stuck turn
+        # surfaces as "assistant unavailable" rather than a clinician staring at a spinner. The
+        # module's own agentgateway.agentTimeoutMillis should be the shorter of the two.
+        proxy_read_timeout ${AGENT_PROXY_READ_TIMEOUT};
+        proxy_send_timeout ${AGENT_PROXY_READ_TIMEOUT};
+    }
+
+    location = /capabilities {
+        proxy_pass http://clinical-agent:8000/capabilities;
+        include /etc/nginx/snippets/proxy.conf;
+    }
+
+    location = /health {
+        access_log off;
+        proxy_pass http://clinical-agent:8000/health;
+        include /etc/nginx/snippets/proxy.conf;
+    }
+
+    # The service also serves FastAPI's /docs and /openapi.json. They describe the hospital's
+    # clinical API surface and have no place being reachable, even from Server 1.
+    location / {
+        return 404;
+    }
+}
+
+# Plain HTTP for this hostname is a misconfiguration, not something to helpfully redirect: a
+# redirect would mean the channel secret had already been sent in clear text.
+server {
+    listen 80;
+    server_name ${AGENT_SERVER_NAME};
+    return 444;
+}

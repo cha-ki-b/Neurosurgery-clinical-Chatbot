@@ -1,0 +1,6 @@
+org\openmrs\module\agentgateway\rollback\OperationTargetTest.class
+org\openmrs\module\agentgateway\rollback\RollbackEngineTest.class
+org\openmrs\module\agentgateway\rollback\RollbackEngineTest$RecordingCaller.class
+org\openmrs\module\agentgateway\rollback\RollbackEngineTest$StubDao.class
+org\openmrs\module\agentgateway\rollback\RollbackEngineTest$1.class
+org\openmrs\module\agentgateway\security\DelegatedTokenTest.class
