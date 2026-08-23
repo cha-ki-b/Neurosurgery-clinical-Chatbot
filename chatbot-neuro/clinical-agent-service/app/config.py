@@ -68,6 +68,21 @@ class Settings:
         default_factory=lambda: os.environ.get("PATIENTVIEW_TOOLS_ENABLED", "false").lower() == "true"
     )
 
+    # --- interpretation (Phase 3) --------------------------------------------
+    # "rules" is the deterministic engine; "medgemma" calls the local model and falls back to the
+    # rules on any failure. Defaults to rules so that a deployment which has not stood up a GPU
+    # keeps working rather than failing every turn.
+    nlu_engine: str = field(default_factory=lambda: os.environ.get("NLU_ENGINE", "rules").lower())
+    # vLLM's OpenAI-compatible base, on the private docker network. Never published: the model
+    # endpoint is unauthenticated, and anything that could reach it could drive it.
+    llm_base_url: str = field(
+        default_factory=lambda: os.environ.get("LLM_BASE_URL", "http://vllm:8000/v1").rstrip("/")
+    )
+    llm_model: str = field(default_factory=lambda: os.environ.get("LLM_MODEL", "medgemma-4b-it"))
+    llm_timeout_seconds: float = field(default_factory=lambda: float(os.environ.get("LLM_TIMEOUT_SECONDS", "25")))
+    # One interpretation is a small JSON object. A generous cap only buys the chance to run long.
+    llm_max_tokens: int = field(default_factory=lambda: int(os.environ.get("LLM_MAX_TOKENS", "512")))
+
     log_prompts: bool = field(default_factory=lambda: os.environ.get("LOG_PROMPTS", "false").lower() == "true")
 
     def validate(self) -> None:

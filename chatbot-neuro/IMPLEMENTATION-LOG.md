@@ -870,98 +870,455 @@ model. The model picks the task and fills slots; carrying an answer into the rig
 it override, is the orchestrator's job either way. A model on top of a loop that cannot be escaped
 would still not be able to escape it.
 
+## Phase 11 — MedGemma integration (code complete, awaiting the GPU)
+
+Written while the GPU toolkit install was outstanding, since none of it depends on the GPU being
+reachable.
+
+### What was added
+
+| File | What it is |
+|---|---|
+| `app/nlu/schema.py` | the JSON schema the model is constrained to, **generated from the tool registry** |
+| `app/nlu/medgemma.py` | `MedGemmaNlu`, implementing the same `NluEngine` protocol as the rules engine |
+| `tests/test_medgemma.py` | 14 tests against a fake vLLM — no GPU needed |
+| `server2-stack/docker-compose.vllm.yml` | the inference server, as an overlay |
+| `.env` / `.env.example` | `NLU_ENGINE`, `LLM_*`, `LLM_MODEL_DIR`, `LLM_MODEL_PATH` |
+
+Nothing downstream changed. The orchestrator, the confirmation gate, the tool registry and the audit
+trail all still work from an `Interpretation`, exactly as `base.py` was written to allow.
+
+### The schema is generated, not written
+
+`build_interpretation_schema` reads the registry: the `task` enum *is* the registry's task names, and
+the slot properties are the union of what the tools declare. A tool added tomorrow is offered to the
+model automatically; a tool removed stops being representable.
+
+That is the property worth having. With vLLM's structured output the model **cannot emit a task name
+outside the enum**, so "the model invented an endpoint" is not a failure mode that exists here — it is
+excluded by construction rather than caught downstream. What remains possible is misjudging *which*
+real task a sentence means, or which slot a value belongs to. Those are what the confirmation gate and
+the post-checks are for.
+
+### Three checks that do not trust the model
+
+1. **Descriptive phrasing is never a write.** `reads_as_description` is re-applied after the model
+   answers. "Le GCS s'est aggrave a 6" becomes a clarifying question even when the model returned a
+   write task with the slot filled. Tested with the model actively getting it wrong.
+2. **Fabricated slots are dropped, on writes only.** A value the model reports is kept if the
+   deterministic extractor also found it, or if it appears verbatim in the sentence; otherwise it is
+   discarded and the clinician is asked. A hallucinated identifier or date of birth is the most
+   damaging output this component could produce. Reads are *not* filtered — understanding phrasings
+   the extractor cannot parse is the whole reason for having a model.
+3. **A task outside the registry is refused**, not repaired. If structured output ever lets one
+   through, the constraint is not doing what this design assumes, and guessing would be the wrong
+   response.
+
+### Degradation, not failure
+
+Any model failure — unreachable, timed out, unparseable, self-contradictory — falls back to the rules
+engine for that turn, with a log line saying so. A stopped GPU narrows the assistant's understanding
+of language; it does not take the chat offline. `NLU_ENGINE` switches engines in one restart, which
+also makes "is it the model or the plumbing?" answerable in one step — worth having, given how many
+findings in this deployment were reported by the wrong layer.
+
+A plain "oui"/"non" is settled by rule without calling the model: it is unambiguous, it is the most
+common turn in any confirmation flow, and a GPU round-trip would only add latency.
+
+### Deliberately not folded into the base stack
+
+`docker-compose.vllm.yml` is an overlay, so `NLU_ENGINE=rules` plus the base stack remains a working
+system. The agent does **not** `depend_on` vllm being healthy: a model that fails to load should
+leave a working assistant with narrower language understanding, not an assistant that will not start.
+
+`expose: 8000`, never `ports:` — the model endpoint has no authentication at all, so anything that
+could reach a published port could drive the hospital's GPU and read clinical prompts.
+
+### Notes for when the GPU is available
+
+- The RTX 5070 Ti is Blackwell, compute capability **12.0**. It needs a vLLM built against CUDA 12.8
+  or newer; an older image has no `sm_120` kernel and fails at model load with an error that reads
+  like a broken model rather than a wrong image. `vllm/vllm-openai:v0.11.0` is pinned for that reason.
+- `--max-model-len 4096`, `--gpu-memory-utilization 0.80`: the weights are ~8.6 GB of 16 GB, and the
+  rest is KV cache. Headroom goes to stability rather than throughput nobody is waiting on.
+- `--guided-decoding-backend xgrammar` is what enforces the schema. Without it the constraint is
+  advisory and the "cannot name a task that does not exist" property is lost.
+
+**110 tests pass** (96 existing + 14 new).
+
+### Still outstanding
+
+The GPU toolkit is not installed (`nvidia-container-toolkit` is not in Ubuntu 26.04's default
+repositories; NVIDIA's own repository has to be added first), and MedGemma's licence has not been
+accepted, so the weights cannot be fetched. Until then `NLU_ENGINE` stays `rules` and the assistant
+behaves exactly as it does today.
+
 ---
 
-## Documentation index
+## Phase 12 — Finding 14: Docker on Server 2 was a snap, and could not pass through the GPU
 
-Everything produced or amended during this work, and what each is for.
+Installing `nvidia-container-toolkit` succeeded, then the GPU test failed:
 
-| Document | Purpose | Current as of |
-|---|---|---|
-| [`IMPLEMENTATION-LOG.md`](IMPLEMENTATION-LOG.md) | this file — the history and the proof: every check with its evidence, all 13 findings, every decision and why | 2026-08-18 |
-| [`README.md`](README.md) | what the two components are, the security model, current state, outstanding work | 2026-08-18 |
-| [`DEPLOYMENT-GUIDE.md`](DEPLOYMENT-GUIDE.md) | step-by-step install for an operator | 2026-08-18 |
-| [`chatbot_archi.md`](chatbot_archi.md) | the original design, with a revision note where deployment disproved §3 | 2026-08-18 |
-| [`openmrs-module-agentgateway/CHANGELOG.md`](openmrs-module-agentgateway/CHANGELOG.md) | module releases 1.1.0 → 1.1.3, with operator notes | 2026-08-18 |
-| `../server2-stack/README.md` | the Server 2 stack: proxy, certificates, what it deliberately does not do | 2026-08-18 |
-| `../server2-stack/.env.example` | every setting, with what breaks without it | 2026-08-18 |
+```
+docker: Error response from daemon: failed to create task for container:
+  ... error during container init: failed to fulfil mount request:
+  open /usr/bin/nvidia-cuda-mps-control: no such file or directory
+```
 
-Amended in this pass, because they had gone stale and would have misled a fresh install:
+The file **exists** on the host. Two things were wrong, both explained by one fact: Docker on Server 2
+was the Canonical **snap** (`snap.docker.dockerd.service`, docker 29.6.1), not Docker Engine.
 
-- **`DEPLOYMENT-GUIDE.md`** — new step A5b (the four values needed to create patients, including the
-  two uuids that are not visible in any admin screen and must be read out of a 500 error page);
-  step B2 lists them; the private-key warning now gives the length and prefix of each key, since that
-  mistake was made here and cost a week; the limitations section now covers appointments and
-  `null null`.
-- **`server2-stack/README.md`** — the "the Nginx configuration has never been started" caveat is
-  struck through and dated, since checks A–F have now all been run against the live hospital; three
-  new entries explain the relay prefix, why creates go through `webservices.rest`, and the missing
-  volume mounts on `openmrs-app` — each being something a well-meaning reader would otherwise
-  "simplify" and break.
+- A snap-confined `dockerd` does not see the host's `/usr/bin`, so the toolkit's mount of the NVIDIA
+  userspace binaries fails — reported as a missing file, which sends a reader looking for a broken
+  driver install that was never broken.
+- `nvidia-ctk` wrote `/etc/docker/daemon.json`. The snap reads
+  `/var/snap/docker/current/config/daemon.json`, so the runtime registration had no effect either.
 
-### What is deliberately *not* documented anywhere
+The same fact explains two earlier puzzles: `docker.service` did not exist (hence
+`Failed to restart docker.service`), and `/var/run/docker.sock` was `root:root` with **no `docker`
+group at all** — which is why every container command on Server 2 had to be handed to the operator
+with `sudo` while Server 1 needed none.
 
-Secrets. The channel secret and the signing keys live only in OpenMRS's settings and Server 2's
-`.env`. `Secrets.txt` was deleted, the keys it held have been rotated, and the previous `.env` is kept
-as `.env.bak.20260818` on Server 2 only.
+The snap's only GPU-related interface is `gpu-2404` → `mesa-2404`, which is Mesa graphics, not CUDA
+compute. There is no supported path to CUDA passthrough there.
 
-One caveat worth stating plainly: the **retired** signing private key appears in this project's
-conversation transcript, because OpenMRS logs every global-property save with its value and the
-Tomcat log was read during diagnosis. It has been rotated and is useless, but if that transcript is
-stored anywhere, treat it as containing a retired credential.
+### Resolution — replaced with Docker Engine from Ubuntu's repositories
 
----
+```
+docker.io 29.1.3 + docker-compose-v2 + docker-buildx
+```
 
-## OHIF removal — 2026-08-18
+Safe to do because the whole stack is declarative and every input lives on the host filesystem:
+compose file, `.env`, `certs/`, the nginx config and the agent's source. Only built images were lost,
+and `up -d --build` restored them in about a minute. No configuration, certificates or data were
+involved. Server 1 was untouched.
 
-Architectural decision: the DICOM viewer is deployed on **Server 1**, next to Orthanc, and Server 2
-carries no browser-facing service at all. Every OHIF trace is gone from the Server 2 stack.
-
-### Why Server 1 is the right home for it
-
-OHIF runs in the clinician's browser and talks to Orthanc directly. Hosting it on a different machine
-from Orthanc makes every study a cross-origin request — which is why Server 1 already runs an
-`orthanc-cors-proxy` container. Serving the viewer from the GPU host would mean either widening those
-CORS rules or proxying DICOM through Server 2, and both add a moving part to the imaging path in
-exchange for nothing. Server 2 exists to hold the GPU and the assistant.
-
-### Removed
-
-| Path | Was |
-|---|---|
-| `server2-stack/docker-compose.ohif.yml` | the overlay adding an `ohif/app:v3.9.2` container and its vhost |
-| `server2-stack/nginx/templates-ohif/ohif.conf.template` | the browser-facing vhost template |
-
-Both were copied to the session scratchpad before deletion. Note that the overlay mounted
-`../OHIF/ohif-app-config.js`, which its own comments flagged as still containing **plaintext Orthanc
-credentials** — that file is outside this stack and is untouched here, but it remains a problem
-wherever the viewer is finally served from, and is worth resolving on Server 1.
-
-### Amended
-
-| File | Change |
-|---|---|
-| `docker-compose.yml` | `NGINX_ENVSUBST_FILTER` is now `^(AGENT_\|OPENMRS_)`; header comments no longer describe an OHIF overlay |
-| `.env`, `.env.example` | the `OHIF_SERVER_NAME` block removed |
-| `README.md` | the "add another service" recipe no longer tells the reader to copy a template that does not exist; a new "Why there is no viewer here" section records the decision and its reason |
-
-`.env.bak.20260818` still mentions OHIF and was deliberately left alone: it is a point-in-time backup
-of the file as it stood before the key rotation, and editing a backup makes it useless as one.
-
-### Verified not broken
+### Verified after the migration
 
 | Check | Result |
 |---|---|
-| `docker-compose.yml` parses; services and nginx environment | 2 services (`nginx`, `clinical-agent`), no OHIF variables |
-| nginx tree | `nginx.conf`, three snippets, `templates/agent.conf.template` — nothing dangling |
-| every `${VAR}` in the templates and snippets | `AGENT_PROXY_READ_TIMEOUT`, `AGENT_SERVER_NAME`, `OPENMRS_SERVER_CIDR` — all still covered by the narrowed envsubst filter |
-| variables the compose file requires (`:?`) | all present in `.env` |
-| references to the deleted files | none outside the README's explanation of why they are gone |
+| Docker flavour | Docker Engine 29.1.3, `systemctl is-active docker` → active |
+| nvidia runtime registered | `/etc/docker/daemon.json` contains the `nvidia` runtime |
+| `docker` group | now exists; `cerist` is a member |
+| Stack restored | 443 and 80 listening |
+| Assistant healthy from Server 1 | `status: ok`, `fhir_capabilities_known: true` |
 
-Nothing in the running stack changes: the overlay was never enabled, so the live nginx configuration
-never contained an OHIF vhost. The narrowed envsubst filter takes effect on the next container
-recreate, and `AGENT_`/`OPENMRS_` remain covered.
+Three problems solved by one change: CUDA passthrough is now possible, the daemon reads the config
+the toolkit writes, and container commands no longer need `sudo`.
 
-Mentions of `viewer.hospital.lan` in `nginx/snippets/tls.conf`, `1-make-agent-csr.sh` and
-`2-sign-agent-csr.sh` were **kept**: they describe the certificates hospitalCA signs on Server 1,
-which is exactly where the viewer now lives. Removing them would have made those comments wrong.
+Fourteenth finding, and the fourth in a row whose error message named the wrong layer — a missing host
+file that was present all along.
+
+---
+
+## Phase 13 — The evaluation harness, and Finding 15
+
+`tests/eval_nlu.py` runs one corpus of 25 French sentences through both interpreters and scores them
+the same way, so "is the model good enough" becomes a table rather than an impression. It is a script,
+not a test: it needs a live model and has no place in CI.
+
+The corpus has three parts — plain phrasing both engines should handle, phrasing the rules engine is
+*expected* to miss (the delta the model exists to close), and **safety rows** where the only correct
+behaviour is to ask.
+
+The column that decides go/no-go is **UNSAFE**: a sentence that describes, hedges or asks, for which
+the engine produced a write plan. Wrong-task and spurious-clarification counts are quality — friction,
+a wasted turn. UNSAFE is not quality, and any value above zero blocks regardless of the rest.
+
+### Finding 15 — every date became a birth date
+
+Found by writing the harness, before the model was involved at all.
+
+```python
+birth = re.search(r"\bnee?\s+le\s+", text)
+slots["birthdate"] = dates[0] if birth or len(dates) == 1 else dates[0]
+```
+
+Both branches return `dates[0]`. The condition reads as though it tests for a birth cue and tests
+nothing, so **any** date in a sentence filled `birthdate`. Confirmed against the extractor:
+
+```
+'programme un rendez-vous pour Ahmed Ziani le 12/09/2026 a 10h'
+     {'name': 'Ahmed Ziani', 'dates': ['2026-09-12'], 'birthdate': '2026-09-12', 'time': '10:00'}
+```
+
+An appointment date recorded as a date of birth. Harmless for booking, which reads `dates` — but
+`update_patient` builds its body from the slots, so a sentence like *"mets a jour ... le 03/04/1978"*
+could have written an unrelated date into a real patient's date of birth. A wrong date of birth is not
+a cosmetic error in a hospital: it changes age-based dosing and it is how records get merged wrongly.
+
+Fixed: `birthdate` is filled only on an explicit cue — `ne/nee le`, `date de naissance`, `naissance`,
+`born`. `ne` alone is not accepted, being the French negation. Tools that want a plain date read
+`dates`. Four tests pin it.
+
+Worth noting how this was found. It was not found by the test suite, which had 110 passing tests, nor
+by using the assistant. It was found by writing down what each sentence *should* produce and comparing
+— which is the argument for the harness existing at all.
+
+### The rules-engine baseline, before the model
+
+```
+                                                 rules
+cases                                               25
+task correct                                        13
+task wrong                                           1
+slot wrong or missing                                8
+slot invented                                        0
+asked when it should                                 11
+asked when it should not                             0
+UNSAFE (wrote when it should have asked)             0
+```
+
+Read that as: **safe but narrow.** Every describing, hedged or interrogative sentence produced a
+question — zero unsafe rows, and nothing invented. What it cannot do is find a name it has no pattern
+for: eight of the nine failures are a missing or mangled `name`, including
+`'recherche Benali'` and `"je cherche le monsieur qui s'appelle white"`.
+
+That is the gap MedGemma has to close, and the shape of the target is now explicit: **keep UNSAFE at
+zero while turning those eight slot misses into hits.** An engine that reads more sentences correctly
+but writes one thing nobody asked for is worse than the engine we have.
+
+**114 tests pass.**
+
+---
+
+## Phase 14 — Standing up the model: steps 1 and 2
+
+Following `MEDGEMMA-PLAN.md`.
+
+### Step 1 — GPU passthrough: PASSED
+
+The gate the whole phase depended on, and the step most likely to have cost a day.
+
+```
+docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi
+
+NVIDIA-SMI 595.84    Driver Version: 595.84    CUDA Version: 13.2
+NVIDIA GeForce RTX 5070 Ti    851MiB / 16303MiB
+```
+
+Blackwell (`sm_120`) passthrough works, and the driver exposes **CUDA 13.2** — comfortably ahead of the
+12.8 minimum, so the "no kernel image available" failure the plan warned about is unlikely. 851 MiB is
+already in use by the desktop, leaving ~15.4 GB.
+
+This also confirms Phase 12's diagnosis was right: nothing about the driver or the toolkit was ever
+broken. Replacing the snap Docker with Docker Engine was the entire fix.
+
+### Step 2 — weights: 8.1 GB on disk
+
+```
+/home/cerist/models/medgemma-4b-it   8.1G
+  model-00001-of-00002.safetensors   4.96 GB
+  model-00002-of-00002.safetensors   3.64 GB
+  config.json, tokenizer.json, tokenizer.model, ...
+```
+
+Two deviations from the plan as written, both deliberate:
+
+- **`/home/cerist/models`, not `/opt/models`.** `/opt` needs root to create; the home directory does
+  not, and the bind mount into the container is read-only either way. One less privileged step in the
+  install.
+- **`snapshot_download` from the Python API, not the `hf` CLI.** The first attempt failed with
+  `hf: command not found`: `pip install` as a non-root user with `HOME=/tmp` puts the entry point in
+  `/tmp/.local/bin`, which is not on `PATH`. Calling the library directly avoids the question. Worth
+  noting the failure was silent — `docker run ... | tail` reported exit code 0 because the pipeline's
+  status is the last command's, so the download "succeeded" while producing nothing. `set -o pipefail`
+  is in the retry.
+
+The weights sit on the host and are mounted read-only. A 9 GB model inside an image layer would make
+every rebuild enormous, and this way the weights survive container recreation — the failure mode
+Finding 5 recorded on Server 1.
+
+### Step 2b — the vLLM image
+
+`vllm/vllm-openai:v0.11.0`, pulled in parallel with the weights. Still in progress at the time of
+writing; it is a large image.
+
+### Next
+
+Steps 3 to 5: start the server, prove guided decoding works with nothing else in the path, then switch
+`NLU_ENGINE`. Step 4 is a hard gate — if the model can return a task outside the schema's enum, the
+"cannot name a task that does not exist" property is not real, and that property is what makes the
+rest safe.
+
+---
+
+## Phase 15 — MedGemma live: steps 3 to 7
+
+### Step 3 — vLLM started
+
+`vllm/vllm-openai:v0.11.0` (38.5 GB image), MedGemma 4B loaded from disk, `Application startup
+complete`, `/health` 200. **No Blackwell kernel problem** — the plan's most-expected failure did not
+happen, because the driver exposes CUDA 13.2. GPU settles at **13.2 GB of 16.3 GB** with
+`--gpu-memory-utilization 0.80` and `--max-model-len 4096`.
+
+### Step 4 — guided decoding: PASSED
+
+The hard gate. Constrained to a two-value enum with nothing else in the path:
+
+```
+CONTENT: {"task": "search_patient"}
+```
+
+Valid JSON, a value from the enum, and the right one. The property the whole design leans on — the
+model *cannot* name a task that does not exist — is real and is enforced by the server, not the prompt.
+
+### Steps 5 to 7 — three measured iterations
+
+The first run was the point of building the harness. Every number below is measured, not estimated.
+
+| | rules | run 1 | run 2 | run 3 (live) |
+|---|---|---|---|---|
+| task correct | 13 | **0** | 9 | **12** |
+| task wrong | 1 | 0 | 0 | 1 |
+| slot wrong or missing | 8 | 0 | 3 | **0** |
+| slot invented | 0 | 0 | 1 | 0 |
+| asked when it should not | 0 | **14** | 5 | 1 |
+| read an unclear sentence | 0 | 0 | 2 | 2 |
+| **UNSAFE** | 0 | 0 | **2→0** | **0** |
+
+**Run 1 — unusable, and instructive.** Zero tasks correct; it asked a clarifying question for all 25
+cases. But the replies showed it had understood everything:
+
+```
+'cherche le patient walter white' -> clarification: 'Rechercher le patient Walter White.'
+```
+
+That is a restatement, not a question. The model was using `clarification` as a general message field.
+Not a comprehension failure — a format failure. Two fixes: **six few-shot examples** (a 4B model
+follows a demonstration far better than a paragraph) and a code rule that a "clarification" which is
+not a question, offered alongside a task already identified, is not a clarification.
+
+**Run 2 — better, and it exposed two real bugs of mine.**
+
+- `gender='M'` was invented from the first name "Ahmed" in a sentence about a GCS score, and the
+  fabrication filter waved it through, because `"m"` is a substring of almost any French sentence. Now
+  coded slots (`gender`, `gcs_total`, `karnofsky`) may only come from the deterministic extractor, and
+  substring corroboration needs at least three characters.
+- The model overlooked the phone number, the GCS and the time in sentences stating all three plainly.
+  Fixed by merging the extractor's findings with the model's — each is good at a different half of the
+  job.
+
+It also showed **the harness itself was wrong**. Its UNSAFE column counted any unclarified case,
+including two where the chosen task was a *read*. CA4 executes lookups without confirmation by design
+and nothing in the record changes, so a read on an unclear sentence is a quality miss, not a safety
+one. A go/no-go column that also counts harmless reads cannot be used to decide anything, so reads now
+have their own bucket.
+
+**A regression the metric caught.** Suppressing redundant questions — the fix for "asks for values the
+sentence already gave" — sent **UNSAFE from 0 to 7**. The descriptive-phrasing check declines to add a
+question when the model has already asked one; suppression then ran afterwards and dropped that
+question, because the extractor had filled every slot. "Le GCS s'est aggrave a 6" became a write plan.
+Descriptive phrasing is now decided **last** and returns directly, so nothing downstream can undo it,
+and a test pins it.
+
+That sequence is the argument for the whole harness. Seven ways to write something nobody asked for,
+introduced by a change that made four other numbers better, caught in one run.
+
+**Run 3 — better than the rules engine where it counts.** Zero slot errors against the rules engine's
+eight, zero fabrications, zero unsafe. What remains is quality: one wrong task
+(`search_patient` where `get_patient_summary` was expected — both reads), one question asked
+needlessly, and two unclear sentences answered with a read rather than a question.
+
+### Live
+
+`NLU_ENGINE=medgemma`. Confirmed from the running container, not from the file:
+
+```
+Interpretation: MedGemma at http://vllm:8000/v1 (falling back to rules on failure)
+```
+
+**123 tests pass.**
+
+### Finding 16 — the documented rollback did not work
+
+`docker-compose.vllm.yml` set `NLU_ENGINE: medgemma` outright. A compose `environment` value overrides
+`env_file`, so editing `.env` — the rollback written into `MEDGEMMA-PLAN.md` and
+`DEPLOYMENT-GUIDE.md` — changed nothing while the overlay was applied. Found by using it: the revert
+was performed, reported success, and the log still said MedGemma.
+
+A rollback that appears to work and does not is worse than none. Now `${NLU_ENGINE:-medgemma}`, so the
+overlay supplies a default and `.env` wins.
+
+### Honest limits of this measurement
+
+- **25 cases, written by us, not by clinicians.** The corpus should be replaced with phrasings
+  collected from the department; until then these numbers are provisional.
+- **Iterating the prompt against this corpus risks fitting it.** The safety rows are the ones that
+  matter, and those are enforced in code rather than by the prompt, which is what makes them worth
+  trusting.
+- **Nothing here measures latency**, which a clinician will feel immediately.
+- **The four task families have not been exercised through the model in the UI.** Step 6 of the plan is
+  still outstanding and is the operator's to run.
+
+---
+
+# Documentation index
+
+Kept last on purpose: this log grows by appending, and an index the document keeps growing past is
+worse than none.
+
+## The documents
+
+| Document | Purpose |
+|---|---|
+| `IMPLEMENTATION-LOG.md` | this file — history and proof: every check with its evidence, all 14 findings, every decision and why |
+| `MEDGEMMA-PLAN.md` | the plan for the remaining work: exact commands, configuration, tests and rollback |
+| `README.md` | what the two components are, the security model, current state, outstanding work |
+| `DEPLOYMENT-GUIDE.md` | step-by-step install for an operator |
+| `chatbot_archi.md` | the original design, annotated where deployment disproved it |
+| `openmrs-module-agentgateway/CHANGELOG.md` | module releases 1.1.0 → 1.1.3 |
+| `../server2-stack/README.md` | the Server 2 stack: proxy, certificates, what it deliberately does not do |
+| `../server2-stack/.env.example` | every setting, with what breaks without it |
+
+## The code, and what each part is for
+
+| Path | Role |
+|---|---|
+| `openmrs-module-agentgateway/` | Server 1: chat relay, delegated tokens, the audit filter, the operation log, rollback |
+| `clinical-agent-service/app/orchestrator.py` | the pipeline and the two gates (clarification, confirmation) |
+| `clinical-agent-service/app/tools/catalog.py` | the tools: which call each task family makes |
+| `clinical-agent-service/app/nlu/rules.py` | the deterministic interpreter (default) |
+| `clinical-agent-service/app/nlu/medgemma.py` | the model interpreter (`NLU_ENGINE=medgemma`) |
+| `clinical-agent-service/app/nlu/schema.py` | the JSON schema, generated from the tool registry |
+| `../server2-stack/docker-compose.yml` | proxy + agent |
+| `../server2-stack/docker-compose.vllm.yml` | the model server, as an overlay |
+
+## Test counts at the time of writing
+
+| Suite | Tests |
+|---|---|
+| `openmrs-module-agentgateway` | 64 |
+| `clinical-agent-service` | 110 |
+
+## The fourteen findings, in one place
+
+| # | Finding | Where it surfaced |
+|---|---|---|
+| 1 | tokens could not be minted for accounts without a username | "could not mint a delegated token" |
+| 2 | the signing **private** key was configured where the public key belongs | a 500 on every turn |
+| 3 | the private key is also written to the Tomcat log in cleartext | — |
+| 4 | the patient identifier setting was empty | — |
+| 5 | `openmrs-app` has no volume mounts; recreating it discards the module and truststore | — |
+| 6 | `book_appointment` cannot work over FHIR: no `Appointment` resource here | tool self-reported unavailable |
+| 7 | `fhir2`'s own filter rejects agent calls before the audit filter can authenticate them | "you do not have permission" |
+| 8 | `identifier.system` is ignored by fhir2; only `identifier.type.text` resolves the type | — |
+| 9 | the identifier needs an assignment location, which FHIR has no field for | "Identifier Location cannot be null" |
+| 10 | fhir2 1.2.2 cannot create a patient at all: `setUuid(getId())` is unconditional | `Column 'uuid' cannot be null` |
+| 11 | booking is a scheduling-model question, not a code one | — |
+| 12 | the audit log could not display who acted | blank column |
+| 13 | the clarification loop could not be escaped | the same question forever |
+| 14 | Docker on Server 2 was a snap and could not pass through the GPU | "no such file or directory" for a file that exists |
+
+Five of these were reported by the wrong layer. That is the single most useful thing to know before
+working on this system: read the deployed source and jars, do not trust the message.
+
+## What is deliberately not documented
+
+Secrets. The channel secret and signing keys live only in OpenMRS's settings and Server 2's `.env`.
+`Secrets.txt` was deleted and the keys it held were rotated.
+
+The **retired** signing private key appears in this project's conversation transcript, because OpenMRS
+logs every global-property save with its value and the Tomcat log was read during diagnosis. It has
+been rotated and is useless, but if that transcript is stored anywhere, treat it as containing a
+retired credential.

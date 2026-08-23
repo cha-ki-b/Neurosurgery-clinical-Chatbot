@@ -170,6 +170,9 @@ _NAME_STOPWORDS = {
     "identifiant", "matricule", "id", "numero", "nom", "prenom", "ans", "an",
     "aujourd", "hui", "demain", "hier", "svp", "merci",
 }
+# What makes a date a *birth* date. "ne"/"nee" only counts immediately before "le", because bare
+# "ne" is the French negation and would match half of everything.
+_BIRTH_CUE_RE = re.compile(r"\bnee?\s+le\b|\bdate de naissance\b|\bnaissance\b|\bborn\b")
 _DATE_DMY_RE = re.compile(r"\b(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{4})\b")
 _DATE_ISO_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 _TIME_RE = re.compile(r"\b(\d{1,2})\s*(?:h|:)\s*(\d{2})?\b")
@@ -254,10 +257,14 @@ def extract_slots(original: str) -> Dict[str, Any]:
     dates = _extract_dates(original, text)
     if dates:
         slots["dates"] = dates
-        # "ne le ..." is unambiguous; otherwise the first date is only a birth date when the turn
-        # is about creating a patient, which the orchestrator decides, not this function.
-        birth = re.search(r"\bnee?\s+le\s+", text)
-        slots["birthdate"] = dates[0] if birth or len(dates) == 1 else dates[0]
+        # A date is a *birth* date only when the sentence says so. The previous version set it for
+        # any date at all - both branches of its ternary returned dates[0], so the condition it
+        # appeared to test did nothing - which meant "programme un rendez-vous le 12/09/2026"
+        # produced birthdate=2026-09-12, and an update turn mentioning any date could have
+        # overwritten a real patient's date of birth. A tool that wants a plain date reads `dates`;
+        # only an explicit birth cue fills `birthdate`.
+        if _BIRTH_CUE_RE.search(text):
+            slots["birthdate"] = dates[0]
 
     time_match = _TIME_RE.search(text)
     if time_match:

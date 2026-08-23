@@ -1,0 +1,87 @@
+# Overlay adding the local MedGemma inference server.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.vllm.yml up -d
+#
+# Kept as an overlay rather than folded into the base stack so the assistant can run without a GPU:
+# with NLU_ENGINE=rules the base stack alone is a working system, and this file is what turns the
+# model on. It also means a GPU problem is one file to disable, not a stack to unpick.
+#
+# Two rules carried over from the rest of this stack, for the same reasons:
+#
+#   * no "ports:" - the model endpoint has NO authentication of any kind. Anything that could reach
+#     a published port could ask it to generate whatever it liked, on the hospital's GPU, and read
+#     the clinical prompts. It is reachable only from the agent, over server2_net.
+#   * pinned image tag - "latest" would mean a silent model-server upgrade on some future restart.
+#
+# The weights are NOT downloaded by this file. MedGemma is a gated model: the licence has to be
+# accepted on huggingface.co first, and the weights are then fetched once into HF_CACHE_DIR. That
+# keeps a closed hospital network from depending on an outbound fetch at container start.
+
+services:
+  vllm:
+    image: vllm/vllm-openai:v0.11.0
+    container_name: vllm
+    restart: unless-stopped
+    # An RTX 5070 Ti is Blackwell (compute capability 12.0). It needs a vLLM built against CUDA
+    # 12.8 or newer; older images have no kernel for sm_120 and fail at model load with a
+    # "no kernel image is available" error that reads like a broken model rather than a wrong image.
+    command:
+      - --model
+      - ${LLM_MODEL_PATH:?set LLM_MODEL_PATH, e.g. /models/medgemma-4b-it}
+      - --served-model-name
+      - ${LLM_MODEL:-medgemma-4b-it}
+      # 4096 covers a system prompt, the tool list and one clinical sentence with room to spare.
+      # Raising it costs KV cache, and 16 GB is not generous once the weights are resident.
+      - --max-model-len
+      - "4096"
+      - --gpu-memory-utilization
+      - "0.80"
+      # One department, one conversation at a time in practice. Headroom goes to stability rather
+      # than to throughput nobody is waiting on.
+      - --max-num-seqs
+      - "8"
+      # xgrammar backs the structured output the interpreter depends on: the model is constrained to
+      # the tool registry's schema, so it cannot name a task that does not exist.
+      - --guided-decoding-backend
+      - xgrammar
+    volumes:
+      # Read-only: inference has no business writing to the weights.
+      - ${LLM_MODEL_DIR:?set LLM_MODEL_DIR, the host directory holding the weights}:/models:ro
+    expose:
+      - "8000"
+    networks:
+      - server2_net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # Model load takes minutes on first start: weights are read from disk, CUDA graphs are captured.
+    # start_period covers that so the container is not restarted while it is legitimately busy.
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 600s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # The agent only needs to know where the model is. It already falls back to the deterministic
+  # interpreter if the model is unreachable, so it deliberately does *not* depend_on vllm being
+  # healthy: a model that fails to load should leave a working assistant with narrower language
+  # understanding, not an assistant that will not start.
+  clinical-agent:
+    environment:
+      # Defaulted, not pinned. Hardcoding `medgemma` here made the documented rollback silently
+      # ineffective: editing NLU_ENGINE in .env changed nothing while this overlay was applied,
+      # because a compose `environment` value overrides the env_file. A rollback that appears to work
+      # and does not is worse than no rollback, so .env wins and this only supplies the default.
+      NLU_ENGINE: ${NLU_ENGINE:-medgemma}
+      LLM_BASE_URL: http://vllm:8000/v1
+      LLM_MODEL: ${LLM_MODEL:-medgemma-4b-it}

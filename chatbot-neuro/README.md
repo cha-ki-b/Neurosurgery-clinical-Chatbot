@@ -399,13 +399,22 @@ Once that lands: set `PATIENTVIEW_TOOLS_ENABLED=true` **and** add `/ws/rest/v1/p
 This is additive to `patientview` — new REST classes, no change to existing pages or services —
 and is what any external integration would need, chatbot or not.
 
-### Phase 3 (agent, read-only, with the model)
+### Phase 3 (the model) — code complete, awaiting the GPU
 
-Replace `RuleBasedNlu` with MedGemma 4B behind `app/nlu/base.py`'s interface, constrained against
-the tool schemas rather than generating free-form calls. Nothing downstream changes. §8 #1 flags
-that tool-calling reliability at 4B needs validating against real French clinical prompts — the
-tests in `test_nlu.py` are a starting corpus, and the deterministic engine remains a useful
-fallback and a comparison baseline.
+`MedGemmaNlu` (`app/nlu/medgemma.py`) implements the same `NluEngine` interface as the rules engine
+and is selected with `NLU_ENGINE=medgemma`. Its output is constrained to a JSON schema **generated
+from the tool registry** (`app/nlu/schema.py`), so it cannot name a task that does not exist. Three
+checks do not trust it: descriptive phrasing never becomes a write, slot values it reports but the
+sentence does not contain are dropped on writes, and an unknown task is refused rather than repaired.
+Any model failure falls back to the rules engine for that turn.
+
+vLLM is a compose overlay (`../server2-stack/docker-compose.vllm.yml`), not part of the base stack:
+with `NLU_ENGINE=rules` the assistant runs with no GPU at all.
+
+Outstanding: the weights are not downloaded and the model has never been served. §8 #1 — whether
+tool selection is reliable at 4B on real French clinical phrasing — remains an open empirical
+question, and the answer is a measurement, not an opinion. The plan for taking it from here, with the
+exact commands, configuration and tests, is [`MEDGEMMA-PLAN.md`](MEDGEMMA-PLAN.md).
 
 ### Phase 4 (agent, writes)
 

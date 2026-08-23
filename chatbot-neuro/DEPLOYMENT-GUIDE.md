@@ -498,6 +498,35 @@ on UUID (architecture section 4.3). When that exists, two things switch it on, a
 1. `PATIENTVIEW_TOOLS_ENABLED=true` in `.env` on SERVER 2
 2. add `/ws/rest/v1/patientview/` to **Audited Path Prefixes** in the OpenMRS settings
 
+## Which interpreter is running
+
+The assistant reads the clinician's sentence with one of two engines, chosen by `NLU_ENGINE` in
+`.env` on SERVER 2:
+
+| Value | What it means |
+|---|---|
+| `rules` (default) | A deterministic French interpreter. No GPU needed. It understands the phrasings it has patterns for and asks a clarifying question otherwise. |
+| `medgemma` | The local MedGemma model served by vLLM. Understands far more phrasing. Falls back to `rules` automatically whenever the model is unreachable or answers unusably. |
+
+Starting the model needs the overlay as well as the base stack:
+
+```bash
+cd ~/server2-stack && docker compose -f docker-compose.yml -f docker-compose.vllm.yml up -d
+```
+
+To go back to the deterministic engine — the first thing to try if a turn is read oddly, because it
+tells you in one restart whether the model or the plumbing is at fault:
+
+```bash
+sed -i 's/^NLU_ENGINE=.*/NLU_ENGINE=rules/' ~/server2-stack/.env && cd ~/server2-stack && docker compose up -d clinical-agent
+```
+
+Which engine is live is stated in the agent's log at startup:
+
+```bash
+docker compose logs clinical-agent | grep Interpretation
+```
+
 ## If you get stuck
 
 | Where to look | Command |

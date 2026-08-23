@@ -68,8 +68,8 @@ class Orchestrator:
         from .config import settings
         from .tools.catalog import build_registry
 
-        self._nlu = nlu or RuleBasedNlu()
         self._tools = tool_registry or build_registry(settings.patientview_tools_enabled)
+        self._nlu = nlu if nlu is not None else _build_nlu(self._tools)
 
     # ------------------------------------------------------------------ entry point
 
@@ -88,7 +88,7 @@ class Orchestrator:
         if state.pending is not None:
             return await self._handle_pending_answer(prompt, delegated_token, user, state)
 
-        interpretation = self._interpret_with_carryover(prompt, state)
+        interpretation = await self._interpret_with_carryover(prompt, state)
 
         if interpretation.intent == INTENT_UNSUPPORTED or interpretation.task is None:
             state.draft_task = None
@@ -161,8 +161,14 @@ class Orchestrator:
 
     # ------------------------------------------------------------------ planning
 
-    def _interpret_with_carryover(self, prompt: str, state) -> Interpretation:
-        interpretation = self._nlu.interpret(prompt, {})
+    async def _interpret_with_carryover(self, prompt: str, state) -> Interpretation:
+        # An engine that talks to a model exposes ``ainterpret``; calling its sync ``interpret``
+        # would block the event loop for the length of a GPU call. The rules engine has only the
+        # sync form, and needs no thread for a handful of regexes.
+        if hasattr(self._nlu, "ainterpret"):
+            interpretation = await self._nlu.ainterpret(prompt, {})
+        else:
+            interpretation = self._nlu.interpret(prompt, {})
 
         draft_task = getattr(state, "draft_task", None)
         awaiting = getattr(state, "awaiting_slot", None)
@@ -467,6 +473,27 @@ def _patient_label(patient: Dict[str, Any]) -> str:
 
 
 _BARE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-]{2,19}$")
+
+
+def _build_nlu(registry: ToolRegistry):
+    """The interpreter this deployment is configured for.
+
+    Defaults to the deterministic engine. A deployment that has not stood up a GPU keeps working
+    rather than failing every turn, and switching is one environment variable - which also makes
+    "is it the model?" answerable in one restart when a turn is read wrongly.
+    """
+    from .config import settings
+
+    if settings.nlu_engine == "medgemma":
+        from .nlu.medgemma import MedGemmaNlu
+
+        log.info("Interpretation: MedGemma at %s (falling back to rules on failure)", settings.llm_base_url)
+        return MedGemmaNlu(registry, fallback=RuleBasedNlu())
+
+    if settings.nlu_engine not in ("rules", ""):
+        log.warning("Unknown NLU_ENGINE %r; using the rules engine", settings.nlu_engine)
+    log.info("Interpretation: deterministic rules engine")
+    return RuleBasedNlu()
 
 
 def _bare_slot_answer(asked: str, prompt: str, already: Dict[str, Any]) -> Tuple[str, Optional[Any]]:
