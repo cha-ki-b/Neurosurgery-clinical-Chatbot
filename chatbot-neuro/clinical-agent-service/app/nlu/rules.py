@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from datetime import date as _date
 from typing import Any, Dict, List, Optional, Tuple
 
 from .base import (
@@ -114,6 +115,15 @@ _TASK_PATTERNS: List[Tuple[str, re.Pattern]] = [
         TASK_UPDATE_PATIENT,
         re.compile(
             r"\b(modifie[rz]?|met[s]? a jour|mettre a jour|mise a jour|corrige[rz]?|change[rz]?|update|correct)\b"
+            # A bare "mets"/"set"/"remplace" followed closely by the name of a demographic field.
+            # Without this, "mets son telephone a 0555123456" matched no task family at all and was
+            # answered with "je n'ai pas compris" - a plain instruction the assistant simply had no
+            # pattern for (Finding 41). The field name is required rather than the verb alone, so
+            # "mets un GCS a 6" stays a neurological score and does not become ambiguous between
+            # two families.
+            r"|\b(met[s]?|mettez|mettre|remplace[rz]?|set|put|fix|edit|modify)\b"
+            r"(?:\s+\S+){0,4}?\s+"
+            r"\b(telephone|tel|numero|portable|mobile|nom|prenom|phone|number|name)\b"
         ),
     ),
     (
@@ -230,6 +240,14 @@ _NAME_STOPWORDS = {
     "mr", "mme", "mlle", "docteur", "dr",
     # English pronouns: the extractor searched OpenMRS for patients called "he" and "his".
     "he", "his", "him", "she", "her", "hers", "they", "them", "its",
+    # French object pronouns and demonstratives, and the English determiners. Same failure, other
+    # half of the vocabulary: "affiche le dossier pour lui" searched OpenMRS for a patient called
+    # "lui" and reported back that no such patient exists - a false clinical fact assembled out of
+    # a grammatical word (Finding 38). Deliberately excludes name particles that really do appear
+    # in patients' names here ("el", "ben", "ould", "abd").
+    "lui", "eux", "celui", "celle", "ceux", "celles", "leur", "leurs",
+    "ce", "cet", "cette", "ces", "meme", "memes", "moi", "toi", "nous",
+    "it", "this", "that", "these", "those", "the", "their", "my", "your", "our", "same",
     # Politeness that trails a name: "de madame Ziani s'il vous plait" yielded "Ziani s'il".
     "s'il", "sil", "vous", "plait", "please",
 }
@@ -323,18 +341,55 @@ def _trim_to_name(candidate: str) -> Optional[str]:
     return " ".join(kept) if kept else None
 
 
-def _extract_dates(original: str, text: str) -> List[str]:
-    """Every date in the turn, ISO-formatted, in the order they appear."""
-    found: List[Tuple[int, str]] = []
+def _is_a_real_date(iso: str) -> bool:
+    """Whether an ISO string names a day that exists.
+
+    The patterns above read three numbers in the right shape; they cannot tell 20/09/2008 from
+    20-99-2008. Without this, the second became the slot value ``2008-99-20``, survived the
+    confirmation summary a clinician approved, and was refused by OpenMRS's own date parser -
+    the first component in the whole chain that consults a calendar (Finding 37).
+    """
+    try:
+        _date.fromisoformat(iso)
+    except ValueError:
+        return False
+    return True
+
+
+def _dates_in(original: str, text: str) -> List[Tuple[int, str, bool]]:
+    """Every date-shaped token in the turn: (position, ISO form, whether it is a real date)."""
+    found: List[Tuple[int, str, bool]] = []
     for match in _DATE_DMY_RE.finditer(original):
         day, month, year = match.groups()
-        found.append((match.start(), f"{year}-{int(month):02d}-{int(day):02d}"))
+        iso = f"{year}-{int(month):02d}-{int(day):02d}"
+        found.append((match.start(), iso, _is_a_real_date(iso)))
     for match in _DATE_ISO_RE.finditer(original):
-        found.append((match.start(), match.group(0)))
+        found.append((match.start(), match.group(0), _is_a_real_date(match.group(0))))
     for match in _DATE_WORDS_RE.finditer(text):
         day, month_name, year = match.groups()
-        found.append((match.start(), f"{year}-{_MONTHS[month_name]:02d}-{int(day):02d}"))
-    return [value for _, value in sorted(found)]
+        iso = f"{year}-{_MONTHS[month_name]:02d}-{int(day):02d}"
+        found.append((match.start(), iso, _is_a_real_date(iso)))
+    return sorted(found)
+
+
+def _extract_dates(original: str, text: str) -> List[str]:
+    """Every *real* date in the turn, ISO-formatted, in the order they appear.
+
+    An impossible date is not returned at all rather than passed on: a slot that is absent gets a
+    question, and a question is the right answer to "20-99-2008". See :func:`impossible_dates_in`
+    for the phrasing of that question.
+    """
+    return [iso for _, iso, real in _dates_in(original, text) if real]
+
+
+def impossible_dates_in(original: str) -> List[str]:
+    """Date-shaped tokens in the turn that name no real day.
+
+    Kept separate from extraction so the assistant can say *why* it is asking again - "20-99-2008
+    n'est pas une date valide" rather than repeating the original question unchanged, which reads
+    as not having listened.
+    """
+    return [iso for _, iso, real in _dates_in(original, normalise(original)) if not real]
 
 
 def extract_slots(original: str) -> Dict[str, Any]:

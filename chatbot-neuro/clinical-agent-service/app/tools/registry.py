@@ -61,6 +61,12 @@ class ToolSpec:
     # rather than telling the clinician to rephrase.
     slot_questions: Dict[str, str] = field(default_factory=dict)
     requires_patient: bool = False
+    # Fields this tool can change on an existing record. Declared rather than inferred so that
+    # "what can I modify?" has exactly one answer, shared by the question the assistant asks, the
+    # vocabulary it will accept in reply, and the values it is willing to write. A field absent
+    # here is one the assistant must not claim it can change - offering "l'adresse" and then
+    # having nowhere to put the value is how an assistant promises something it cannot do.
+    updatable_fields: Tuple[str, ...] = ()
     fhir_resource: Optional[str] = None
     fhir_interaction: Optional[str] = None
     # Set for tools that target a module's own REST resources rather than FHIR (ADR-10's second

@@ -14,7 +14,7 @@ words, before anything is sent - that summary *is* the confirmation gate (CA5, A
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from ..nlu.base import (
     TASK_BOOK_APPOINTMENT,
@@ -346,13 +346,23 @@ def _build_update_patient(slots: Dict[str, Any], context: Dict[str, Any]) -> Lis
 
 
 def _summarise_update_patient(slots: Dict[str, Any], context: Dict[str, Any]) -> str:
+    """The summary a clinician approves before a record is changed.
+
+    It names the patient unconditionally. Measured: when the patient came from the open chart or
+    from an earlier turn rather than from this sentence, ``patient_label`` was the empty string and
+    the summary read "Je vais MODIFIER la fiche du patient  :" - a write approved without the
+    clinician being told whose record it lands in. The label is now carried on the frame, and this
+    falls back to the uuid rather than to nothing, because an opaque identifier is still something
+    that can be checked and a blank is not.
+    """
     changes = []
     if slots.get("phone"):
         changes.append(f"  - Telephone : {slots['phone']}")
     if slots.get("name"):
         changes.append(f"  - Nom : {slots['name']}")
+    who = context.get("patient_label") or context.get("patient_uuid") or "(patient non identifie)"
     return "\n".join(
-        ["Je vais MODIFIER la fiche du patient " + context.get("patient_label", "") + " :"]
+        [f"Je vais MODIFIER la fiche du patient {who} :"]
         + changes
         + ["Les autres champs resteront inchanges. Confirmez-vous la modification ?"]
     )
@@ -497,6 +507,14 @@ TOOLS = [
         writes=True,
         description="Mettre a jour les informations administratives d'un patient",
         requires_patient=True,
+        # The two fields _build_update_patient can actually write. Everything the assistant offers
+        # to change, accepts as an answer to "what should I change?", and resolves "it" against
+        # comes from this one tuple.
+        updatable_fields=("phone", "name"),
+        slot_questions={
+            "phone": "Quel est le nouveau numero de telephone ?",
+            "name": "Quel est le nouveau nom du patient ?",
+        },
         # No fhir_resource: targets webservices.rest, not FHIR (see the note on _build_update_patient
         # - a FHIR PUT cannot actually change an existing telecom or name value on this deployment).
         # Availability therefore is not read from the FHIR capability statement, matching

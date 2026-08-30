@@ -43,6 +43,7 @@ from .base import (
     INTENT_UNSUPPORTED,
     Interpretation,
 )
+from ..dialogue.references import looks_like_a_person_name
 from .rules import RuleBasedNlu, classify_answer, extract_slots, reads_as_description
 from .schema import build_interpretation_schema, describe_tools_for_prompt
 
@@ -55,18 +56,6 @@ _EXTRACTOR_ONLY_SLOTS = {"gender", "gcs_total", "karnofsky"}
 # Below this, a substring match is coincidence rather than evidence.
 _MIN_CORROBORATION_CHARS = 3
 
-
-def _has_no_letters(value: str) -> bool:
-    """True for a value that cannot possibly be a person's name.
-
-    A name always has at least one letter; a bare phone number does not. Needed because the
-    substring corroboration check below proves too much on its own: "mets a jour son telephone a
-    0666777888" has no name in it at all, but the model returned slots={"name": "0666777888",
-    "phone": "0666777888"} - and "0666777888" *is* a substring of the sentence, so corroboration
-    alone waved the phone number through as a name, which then got searched as a patient
-    identifier instead of the anaphora target the sentence actually meant.
-    """
-    return not any(char.isalpha() for char in value)
 
 # Free-text slots where the model's answer is kept over the extractor's. The regexes cut names on
 # fixed word counts and swallow politeness ("madame Ziani s'il"); the model reads the name.
@@ -154,6 +143,14 @@ Une demande, meme vague ou incomplete, qui concerne clairement un patient n'est 
 francais courant, ecrite pour la situation precise de ce tour - jamais un texte generique repete \
 mot pour mot d'un tour a l'autre. Une vraie question se termine par « ? ». N'y mets jamais un nom \
 de categorie ni un nom de champ : le clinicien qui la lit ne les connait pas.
+
+6. Si une section « Contexte de la conversation » est presente, la phrase POURSUIT cette demande. \
+Garde la meme "task" et ne renseigne que ce que la phrase ajoute. Les pronoms et les tournures \
+courtes (« il », « elle », « son », « le », « ca », « it », « that », « the same ») renvoient a ce \
+contexte : ne les mets JAMAIS dans "name" - un pronom n'est pas un nom de patient. Ne redemande \
+jamais dans "clarification" une information deja listee dans le contexte. Une phrase qui ne fait \
+que nommer un champ (« le telephone », « son nom ») est une reponse valable : renseigne la tache \
+en cours, sans inventer de valeur.
 
 Reponds uniquement par l'objet JSON."""
 
@@ -298,7 +295,7 @@ class MedGemmaNlu:
             return Interpretation(intent=answer)
 
         try:
-            payload = await self._ask_model(prompt)
+            payload = await self._ask_model(prompt, context)
         except Exception as exc:  # noqa: BLE001 - any model failure degrades, never fails the turn
             log.warning("MedGemma unavailable, falling back to the rules engine: %s", exc)
             return self._fallback.interpret(prompt, context)
@@ -350,7 +347,41 @@ class MedGemmaNlu:
         )
         return deterministic
 
-    def _messages(self, prompt: str) -> List[Dict[str, str]]:
+    @staticmethod
+    def _context_block(context: Dict[str, Any]) -> str:
+        """What the conversation has already established, stated to the model.
+
+        Until now this method's caller passed ``{}`` on every turn, so the model read each
+        sentence as though it were the first: "change it to 06564565" arrived with no idea what
+        "it" was, and answered accordingly.
+
+        It is given as context, never as instruction. The frame in ``app.conversation`` remains the
+        only thing that can actually fill a slot - what this buys is a model that stops proposing
+        a fresh search when the clinician is plainly still mid-request.
+        """
+        if not context:
+            return ""
+        lines: List[str] = []
+        if context.get("active_task"):
+            lines.append(f"- tache en cours : {context['active_task']}")
+        if context.get("active_patient"):
+            lines.append(f"- patient concerne : {context['active_patient']}")
+        if context.get("active_field"):
+            lines.append(f"- champ en cours de modification : {context['active_field']}")
+        known = {key: value for key, value in (context.get("known_slots") or {}).items() if value}
+        if known:
+            lines.append("- deja renseigne : " + ", ".join(f"{key}={value}" for key, value in sorted(known.items())))
+        if not lines:
+            return ""
+        return (
+            "## Contexte de la conversation\n"
+            "La phrase ci-dessous poursuit une demande deja commencee. Les pronoms (« il », « son », "
+            "« le », « it », « that ») y renvoient. Ne redemande pas ce qui figure ici.\n"
+            + "\n".join(lines)
+            + "\n\n"
+        )
+
+    def _messages(self, prompt: str, context: Optional[Dict[str, Any]] = None) -> List[Dict[str, str]]:
         """The turns sent to the model, few-shot examples first and the rules last.
 
         **There is no system message.** Gemma 3 - and so MedGemma - has no ``system`` turn in its chat
@@ -367,13 +398,17 @@ class MedGemmaNlu:
         for shot in FEW_SHOT:
             messages.append({"role": "user", "content": shot["user"]})
             messages.append({"role": "assistant", "content": shot["assistant"]})
-        messages.append({"role": "user", "content": f"{self._system_prompt}\n\n---\n\nPhrase a interpreter :\n{prompt}"})
+        messages.append({
+            "role": "user",
+            "content": f"{self._system_prompt}\n\n---\n\n{self._context_block(context or {})}"
+                       f"Phrase a interpreter :\n{prompt}",
+        })
         return messages
 
-    async def _ask_model(self, prompt: str) -> Dict[str, Any]:
+    async def _ask_model(self, prompt: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         body = {
             "model": settings.llm_model,
-            "messages": self._messages(prompt),
+            "messages": self._messages(prompt, context),
             # Deterministic on purpose: the same sentence must be read the same way twice. A
             # clinician who rephrases nothing and gets a different task the second time has no way
             # to trust the thing.
@@ -504,7 +539,12 @@ class MedGemmaNlu:
             # turns a findable patient into a false "not found" ("Ziani" became "Ahmed Ziani",
             # Finding 34). Require the name to actually be in the sentence outside writes too.
             name = str(interpretation.slots["name"]).strip().lower()
-            if name and (name not in prompt.lower() or _has_no_letters(name)):
+            if name and (name not in prompt.lower() or not looks_like_a_person_name(name)):
+                # ``looks_like_a_person_name`` also rejects a name made only of grammatical words.
+                # Measured: "generate a report for him" produced slots={"name": "him"}, which passes
+                # the substring test by definition, was searched for as a patient, and came back
+                # empty - reported to the clinician as "no patient matches", a false clinical fact
+                # manufactured out of a pronoun (Finding 38).
                 log.info("Dropping an unusable name: %r", interpretation.slots["name"])
                 interpretation.slots.pop("name", None)
 
@@ -605,7 +645,7 @@ class MedGemmaNlu:
                 # legitimate value for a single field.
                 log.info("Dropping slot %s=%r: it is the whole prompt, not a value in it", key, value)
                 continue
-            if key == "name" and _has_no_letters(text):
+            if key == "name" and not looks_like_a_person_name(text):
                 # A phone number or an identifier is a substring of the sentence by definition
                 # when the clinician typed it - that alone is not evidence it was meant as a name.
                 # Measured: "mets a jour son telephone a 0666777888" came back with slots={"name":
