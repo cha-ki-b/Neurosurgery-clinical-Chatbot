@@ -63,6 +63,42 @@ public class OperationTargetTest {
 	}
 
 	@Test
+	public void aPersonAttributeUpdateIsRecognisedAsAnInstance() {
+		// update_patient_demographics writes phone changes through person/{uuid}/attribute/{id}
+		// (Phase 20 - fhir2's own Patient PUT cannot actually change an existing attribute value).
+		// Unlike the general "deeper sub-resource" case above, this one specific shape is
+		// understood: the sub-resource id is the operation's real target.
+		OperationTarget target = OperationTarget.parse("POST /ws/rest/v1/person/abc-123/attribute/attr-456");
+		assertEquals("attr-456", target.getResourceId());
+		assertEquals(OperationTarget.Kind.UPDATE, target.getKind());
+		assertEquals("/ws/rest/v1/person/abc-123/attribute/attr-456", target.instancePath("attr-456"));
+	}
+
+	@Test
+	public void aPersonNameUpdateIsRecognisedAsAnInstance() {
+		OperationTarget target = OperationTarget.parse("POST /ws/rest/v1/person/abc-123/name/name-456");
+		assertEquals("name-456", target.getResourceId());
+		assertEquals(OperationTarget.Kind.UPDATE, target.getKind());
+	}
+
+	@Test
+	public void addingAPersonsFirstAttributeIsStillACreate() {
+		// person/{uuid}/attribute (three segments, no trailing id) is the collection - a brand
+		// new attribute, not an edit to one that already exists.
+		OperationTarget target = OperationTarget.parse("POST /ws/rest/v1/person/abc-123/attribute");
+		assertNull(target.getResourceId());
+		assertEquals(OperationTarget.Kind.CREATE, target.getKind());
+	}
+
+	@Test
+	public void aPersonSubResourceOutsideTheKnownSetIsStillUnrecognised() {
+		// Same four-segment shape, but not one of the two collections this engine actually
+		// understands - still refused rather than guessed at.
+		OperationTarget target = OperationTarget.parse("POST /ws/rest/v1/person/abc-123/address/addr-456");
+		assertNull(target.getResourceId());
+	}
+
+	@Test
 	public void anythingOutsideTheApiSurfaceIsFlaggedAsSuch() {
 		OperationTarget target = OperationTarget.parse("POST /module/patientview/addNeuroAssessment.form");
 		assertEquals(OperationTarget.Family.OTHER, target.getFamily());

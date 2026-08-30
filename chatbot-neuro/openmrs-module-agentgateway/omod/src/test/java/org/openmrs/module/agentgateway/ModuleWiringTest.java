@@ -286,7 +286,7 @@ public class ModuleWiringTest {
 	public void everyCssClassIsPrefixedSoItCannotCollideWithBootstrap() throws Exception {
 		// The Reference Application loads Bootstrap globally; a generic class name silently
 		// inherits its styling. This deployment has already lost a UI to that once.
-		String css = read(OMOD.resolve("src/main/webapp/resources/css/agentgateway.css"));
+		String css = read(OMOD.resolve("src/main/webapp/resources/styles/agentgateway.css"));
 		Matcher selectors = Pattern.compile("^\\.([\\w-]+)", Pattern.MULTILINE).matcher(css);
 
 		List<String> unprefixed = new ArrayList<String>();
@@ -409,5 +409,25 @@ public class ModuleWiringTest {
 	private String firstMatch(String source, String regex) {
 		Matcher matcher = Pattern.compile(regex, Pattern.DOTALL).matcher(source);
 		return matcher.find() ? matcher.group(1) : null;
+	}
+
+	/**
+	 * The stylesheet has to sit where {@code ui.includeCss} looks for it.
+	 *
+	 * It did not. The UI framework resolves {@code ui.includeCss(provider, file)} to
+	 * {@code /moduleResources/<provider>/styles/<file>} and {@code ui.includeJavascript} to
+	 * {@code .../scripts/<file>}. The javascript was in {@code resources/scripts/} and loaded; the
+	 * stylesheet was in {@code resources/css/} and returned 404 on every page - the chat panel, the
+	 * widget and the administrator's operation log. The chat therefore worked perfectly while being
+	 * entirely unstyled, which read as "nobody designed a distinction between the clinician's
+	 * messages and the assistant's" when {@code .agent-message-user} and {@code .agent-message-bot}
+	 * had been there all along.
+	 */
+	@Test
+	public void stylesheetIsWhereTheUiFrameworkLooksForIt() {
+		assertTrue("agentgateway.css must live in resources/styles/, not resources/css/",
+				new File("src/main/webapp/resources/styles/agentgateway.css").isFile());
+		assertFalse("a stylesheet in resources/css/ is never served",
+				new File("src/main/webapp/resources/css/agentgateway.css").isFile());
 	}
 }

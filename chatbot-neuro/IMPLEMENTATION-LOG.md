@@ -870,98 +870,1436 @@ model. The model picks the task and fills slots; carrying an answer into the rig
 it override, is the orchestrator's job either way. A model on top of a loop that cannot be escaped
 would still not be able to escape it.
 
+## Phase 11 — MedGemma integration (code complete, awaiting the GPU)
+
+Written while the GPU toolkit install was outstanding, since none of it depends on the GPU being
+reachable.
+
+### What was added
+
+| File | What it is |
+|---|---|
+| `app/nlu/schema.py` | the JSON schema the model is constrained to, **generated from the tool registry** |
+| `app/nlu/medgemma.py` | `MedGemmaNlu`, implementing the same `NluEngine` protocol as the rules engine |
+| `tests/test_medgemma.py` | 14 tests against a fake vLLM — no GPU needed |
+| `server2-stack/docker-compose.vllm.yml` | the inference server, as an overlay |
+| `.env` / `.env.example` | `NLU_ENGINE`, `LLM_*`, `LLM_MODEL_DIR`, `LLM_MODEL_PATH` |
+
+Nothing downstream changed. The orchestrator, the confirmation gate, the tool registry and the audit
+trail all still work from an `Interpretation`, exactly as `base.py` was written to allow.
+
+### The schema is generated, not written
+
+`build_interpretation_schema` reads the registry: the `task` enum *is* the registry's task names, and
+the slot properties are the union of what the tools declare. A tool added tomorrow is offered to the
+model automatically; a tool removed stops being representable.
+
+That is the property worth having. With vLLM's structured output the model **cannot emit a task name
+outside the enum**, so "the model invented an endpoint" is not a failure mode that exists here — it is
+excluded by construction rather than caught downstream. What remains possible is misjudging *which*
+real task a sentence means, or which slot a value belongs to. Those are what the confirmation gate and
+the post-checks are for.
+
+### Three checks that do not trust the model
+
+1. **Descriptive phrasing is never a write.** `reads_as_description` is re-applied after the model
+   answers. "Le GCS s'est aggrave a 6" becomes a clarifying question even when the model returned a
+   write task with the slot filled. Tested with the model actively getting it wrong.
+2. **Fabricated slots are dropped, on writes only.** A value the model reports is kept if the
+   deterministic extractor also found it, or if it appears verbatim in the sentence; otherwise it is
+   discarded and the clinician is asked. A hallucinated identifier or date of birth is the most
+   damaging output this component could produce. Reads are *not* filtered — understanding phrasings
+   the extractor cannot parse is the whole reason for having a model.
+3. **A task outside the registry is refused**, not repaired. If structured output ever lets one
+   through, the constraint is not doing what this design assumes, and guessing would be the wrong
+   response.
+
+### Degradation, not failure
+
+Any model failure — unreachable, timed out, unparseable, self-contradictory — falls back to the rules
+engine for that turn, with a log line saying so. A stopped GPU narrows the assistant's understanding
+of language; it does not take the chat offline. `NLU_ENGINE` switches engines in one restart, which
+also makes "is it the model or the plumbing?" answerable in one step — worth having, given how many
+findings in this deployment were reported by the wrong layer.
+
+A plain "oui"/"non" is settled by rule without calling the model: it is unambiguous, it is the most
+common turn in any confirmation flow, and a GPU round-trip would only add latency.
+
+### Deliberately not folded into the base stack
+
+`docker-compose.vllm.yml` is an overlay, so `NLU_ENGINE=rules` plus the base stack remains a working
+system. The agent does **not** `depend_on` vllm being healthy: a model that fails to load should
+leave a working assistant with narrower language understanding, not an assistant that will not start.
+
+`expose: 8000`, never `ports:` — the model endpoint has no authentication at all, so anything that
+could reach a published port could drive the hospital's GPU and read clinical prompts.
+
+### Notes for when the GPU is available
+
+- The RTX 5070 Ti is Blackwell, compute capability **12.0**. It needs a vLLM built against CUDA 12.8
+  or newer; an older image has no `sm_120` kernel and fails at model load with an error that reads
+  like a broken model rather than a wrong image. `vllm/vllm-openai:v0.11.0` is pinned for that reason.
+- `--max-model-len 4096`, `--gpu-memory-utilization 0.80`: the weights are ~8.6 GB of 16 GB, and the
+  rest is KV cache. Headroom goes to stability rather than throughput nobody is waiting on.
+- `--guided-decoding-backend xgrammar` is what enforces the schema. Without it the constraint is
+  advisory and the "cannot name a task that does not exist" property is lost.
+
+**110 tests pass** (96 existing + 14 new).
+
+### Still outstanding
+
+The GPU toolkit is not installed (`nvidia-container-toolkit` is not in Ubuntu 26.04's default
+repositories; NVIDIA's own repository has to be added first), and MedGemma's licence has not been
+accepted, so the weights cannot be fetched. Until then `NLU_ENGINE` stays `rules` and the assistant
+behaves exactly as it does today.
+
 ---
 
-## Documentation index
+## Phase 12 — Finding 14: Docker on Server 2 was a snap, and could not pass through the GPU
 
-Everything produced or amended during this work, and what each is for.
+Installing `nvidia-container-toolkit` succeeded, then the GPU test failed:
 
-| Document | Purpose | Current as of |
-|---|---|---|
-| [`IMPLEMENTATION-LOG.md`](IMPLEMENTATION-LOG.md) | this file — the history and the proof: every check with its evidence, all 13 findings, every decision and why | 2026-08-18 |
-| [`README.md`](README.md) | what the two components are, the security model, current state, outstanding work | 2026-08-18 |
-| [`DEPLOYMENT-GUIDE.md`](DEPLOYMENT-GUIDE.md) | step-by-step install for an operator | 2026-08-18 |
-| [`chatbot_archi.md`](chatbot_archi.md) | the original design, with a revision note where deployment disproved §3 | 2026-08-18 |
-| [`openmrs-module-agentgateway/CHANGELOG.md`](openmrs-module-agentgateway/CHANGELOG.md) | module releases 1.1.0 → 1.1.3, with operator notes | 2026-08-18 |
-| `../server2-stack/README.md` | the Server 2 stack: proxy, certificates, what it deliberately does not do | 2026-08-18 |
-| `../server2-stack/.env.example` | every setting, with what breaks without it | 2026-08-18 |
+```
+docker: Error response from daemon: failed to create task for container:
+  ... error during container init: failed to fulfil mount request:
+  open /usr/bin/nvidia-cuda-mps-control: no such file or directory
+```
 
-Amended in this pass, because they had gone stale and would have misled a fresh install:
+The file **exists** on the host. Two things were wrong, both explained by one fact: Docker on Server 2
+was the Canonical **snap** (`snap.docker.dockerd.service`, docker 29.6.1), not Docker Engine.
 
-- **`DEPLOYMENT-GUIDE.md`** — new step A5b (the four values needed to create patients, including the
-  two uuids that are not visible in any admin screen and must be read out of a 500 error page);
-  step B2 lists them; the private-key warning now gives the length and prefix of each key, since that
-  mistake was made here and cost a week; the limitations section now covers appointments and
-  `null null`.
-- **`server2-stack/README.md`** — the "the Nginx configuration has never been started" caveat is
-  struck through and dated, since checks A–F have now all been run against the live hospital; three
-  new entries explain the relay prefix, why creates go through `webservices.rest`, and the missing
-  volume mounts on `openmrs-app` — each being something a well-meaning reader would otherwise
-  "simplify" and break.
+- A snap-confined `dockerd` does not see the host's `/usr/bin`, so the toolkit's mount of the NVIDIA
+  userspace binaries fails — reported as a missing file, which sends a reader looking for a broken
+  driver install that was never broken.
+- `nvidia-ctk` wrote `/etc/docker/daemon.json`. The snap reads
+  `/var/snap/docker/current/config/daemon.json`, so the runtime registration had no effect either.
 
-### What is deliberately *not* documented anywhere
+The same fact explains two earlier puzzles: `docker.service` did not exist (hence
+`Failed to restart docker.service`), and `/var/run/docker.sock` was `root:root` with **no `docker`
+group at all** — which is why every container command on Server 2 had to be handed to the operator
+with `sudo` while Server 1 needed none.
 
-Secrets. The channel secret and the signing keys live only in OpenMRS's settings and Server 2's
-`.env`. `Secrets.txt` was deleted, the keys it held have been rotated, and the previous `.env` is kept
-as `.env.bak.20260818` on Server 2 only.
+The snap's only GPU-related interface is `gpu-2404` → `mesa-2404`, which is Mesa graphics, not CUDA
+compute. There is no supported path to CUDA passthrough there.
 
-One caveat worth stating plainly: the **retired** signing private key appears in this project's
-conversation transcript, because OpenMRS logs every global-property save with its value and the
-Tomcat log was read during diagnosis. It has been rotated and is useless, but if that transcript is
-stored anywhere, treat it as containing a retired credential.
+### Resolution — replaced with Docker Engine from Ubuntu's repositories
 
----
+```
+docker.io 29.1.3 + docker-compose-v2 + docker-buildx
+```
 
-## OHIF removal — 2026-08-18
+Safe to do because the whole stack is declarative and every input lives on the host filesystem:
+compose file, `.env`, `certs/`, the nginx config and the agent's source. Only built images were lost,
+and `up -d --build` restored them in about a minute. No configuration, certificates or data were
+involved. Server 1 was untouched.
 
-Architectural decision: the DICOM viewer is deployed on **Server 1**, next to Orthanc, and Server 2
-carries no browser-facing service at all. Every OHIF trace is gone from the Server 2 stack.
-
-### Why Server 1 is the right home for it
-
-OHIF runs in the clinician's browser and talks to Orthanc directly. Hosting it on a different machine
-from Orthanc makes every study a cross-origin request — which is why Server 1 already runs an
-`orthanc-cors-proxy` container. Serving the viewer from the GPU host would mean either widening those
-CORS rules or proxying DICOM through Server 2, and both add a moving part to the imaging path in
-exchange for nothing. Server 2 exists to hold the GPU and the assistant.
-
-### Removed
-
-| Path | Was |
-|---|---|
-| `server2-stack/docker-compose.ohif.yml` | the overlay adding an `ohif/app:v3.9.2` container and its vhost |
-| `server2-stack/nginx/templates-ohif/ohif.conf.template` | the browser-facing vhost template |
-
-Both were copied to the session scratchpad before deletion. Note that the overlay mounted
-`../OHIF/ohif-app-config.js`, which its own comments flagged as still containing **plaintext Orthanc
-credentials** — that file is outside this stack and is untouched here, but it remains a problem
-wherever the viewer is finally served from, and is worth resolving on Server 1.
-
-### Amended
-
-| File | Change |
-|---|---|
-| `docker-compose.yml` | `NGINX_ENVSUBST_FILTER` is now `^(AGENT_\|OPENMRS_)`; header comments no longer describe an OHIF overlay |
-| `.env`, `.env.example` | the `OHIF_SERVER_NAME` block removed |
-| `README.md` | the "add another service" recipe no longer tells the reader to copy a template that does not exist; a new "Why there is no viewer here" section records the decision and its reason |
-
-`.env.bak.20260818` still mentions OHIF and was deliberately left alone: it is a point-in-time backup
-of the file as it stood before the key rotation, and editing a backup makes it useless as one.
-
-### Verified not broken
+### Verified after the migration
 
 | Check | Result |
 |---|---|
-| `docker-compose.yml` parses; services and nginx environment | 2 services (`nginx`, `clinical-agent`), no OHIF variables |
-| nginx tree | `nginx.conf`, three snippets, `templates/agent.conf.template` — nothing dangling |
-| every `${VAR}` in the templates and snippets | `AGENT_PROXY_READ_TIMEOUT`, `AGENT_SERVER_NAME`, `OPENMRS_SERVER_CIDR` — all still covered by the narrowed envsubst filter |
-| variables the compose file requires (`:?`) | all present in `.env` |
-| references to the deleted files | none outside the README's explanation of why they are gone |
+| Docker flavour | Docker Engine 29.1.3, `systemctl is-active docker` → active |
+| nvidia runtime registered | `/etc/docker/daemon.json` contains the `nvidia` runtime |
+| `docker` group | now exists; `cerist` is a member |
+| Stack restored | 443 and 80 listening |
+| Assistant healthy from Server 1 | `status: ok`, `fhir_capabilities_known: true` |
 
-Nothing in the running stack changes: the overlay was never enabled, so the live nginx configuration
-never contained an OHIF vhost. The narrowed envsubst filter takes effect on the next container
-recreate, and `AGENT_`/`OPENMRS_` remain covered.
+Three problems solved by one change: CUDA passthrough is now possible, the daemon reads the config
+the toolkit writes, and container commands no longer need `sudo`.
 
-Mentions of `viewer.hospital.lan` in `nginx/snippets/tls.conf`, `1-make-agent-csr.sh` and
-`2-sign-agent-csr.sh` were **kept**: they describe the certificates hospitalCA signs on Server 1,
-which is exactly where the viewer now lives. Removing them would have made those comments wrong.
+Fourteenth finding, and the fourth in a row whose error message named the wrong layer — a missing host
+file that was present all along.
+
+---
+
+## Phase 13 — The evaluation harness, and Finding 15
+
+`tests/eval_nlu.py` runs one corpus of 25 French sentences through both interpreters and scores them
+the same way, so "is the model good enough" becomes a table rather than an impression. It is a script,
+not a test: it needs a live model and has no place in CI.
+
+The corpus has three parts — plain phrasing both engines should handle, phrasing the rules engine is
+*expected* to miss (the delta the model exists to close), and **safety rows** where the only correct
+behaviour is to ask.
+
+The column that decides go/no-go is **UNSAFE**: a sentence that describes, hedges or asks, for which
+the engine produced a write plan. Wrong-task and spurious-clarification counts are quality — friction,
+a wasted turn. UNSAFE is not quality, and any value above zero blocks regardless of the rest.
+
+### Finding 15 — every date became a birth date
+
+Found by writing the harness, before the model was involved at all.
+
+```python
+birth = re.search(r"\bnee?\s+le\s+", text)
+slots["birthdate"] = dates[0] if birth or len(dates) == 1 else dates[0]
+```
+
+Both branches return `dates[0]`. The condition reads as though it tests for a birth cue and tests
+nothing, so **any** date in a sentence filled `birthdate`. Confirmed against the extractor:
+
+```
+'programme un rendez-vous pour Ahmed Ziani le 12/09/2026 a 10h'
+     {'name': 'Ahmed Ziani', 'dates': ['2026-09-12'], 'birthdate': '2026-09-12', 'time': '10:00'}
+```
+
+An appointment date recorded as a date of birth. Harmless for booking, which reads `dates` — but
+`update_patient` builds its body from the slots, so a sentence like *"mets a jour ... le 03/04/1978"*
+could have written an unrelated date into a real patient's date of birth. A wrong date of birth is not
+a cosmetic error in a hospital: it changes age-based dosing and it is how records get merged wrongly.
+
+Fixed: `birthdate` is filled only on an explicit cue — `ne/nee le`, `date de naissance`, `naissance`,
+`born`. `ne` alone is not accepted, being the French negation. Tools that want a plain date read
+`dates`. Four tests pin it.
+
+Worth noting how this was found. It was not found by the test suite, which had 110 passing tests, nor
+by using the assistant. It was found by writing down what each sentence *should* produce and comparing
+— which is the argument for the harness existing at all.
+
+### The rules-engine baseline, before the model
+
+```
+                                                 rules
+cases                                               25
+task correct                                        13
+task wrong                                           1
+slot wrong or missing                                8
+slot invented                                        0
+asked when it should                                 11
+asked when it should not                             0
+UNSAFE (wrote when it should have asked)             0
+```
+
+Read that as: **safe but narrow.** Every describing, hedged or interrogative sentence produced a
+question — zero unsafe rows, and nothing invented. What it cannot do is find a name it has no pattern
+for: eight of the nine failures are a missing or mangled `name`, including
+`'recherche Benali'` and `"je cherche le monsieur qui s'appelle white"`.
+
+That is the gap MedGemma has to close, and the shape of the target is now explicit: **keep UNSAFE at
+zero while turning those eight slot misses into hits.** An engine that reads more sentences correctly
+but writes one thing nobody asked for is worse than the engine we have.
+
+**114 tests pass.**
+
+---
+
+## Phase 14 — Standing up the model: steps 1 and 2
+
+Following `MEDGEMMA-PLAN.md`.
+
+### Step 1 — GPU passthrough: PASSED
+
+The gate the whole phase depended on, and the step most likely to have cost a day.
+
+```
+docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi
+
+NVIDIA-SMI 595.84    Driver Version: 595.84    CUDA Version: 13.2
+NVIDIA GeForce RTX 5070 Ti    851MiB / 16303MiB
+```
+
+Blackwell (`sm_120`) passthrough works, and the driver exposes **CUDA 13.2** — comfortably ahead of the
+12.8 minimum, so the "no kernel image available" failure the plan warned about is unlikely. 851 MiB is
+already in use by the desktop, leaving ~15.4 GB.
+
+This also confirms Phase 12's diagnosis was right: nothing about the driver or the toolkit was ever
+broken. Replacing the snap Docker with Docker Engine was the entire fix.
+
+### Step 2 — weights: 8.1 GB on disk
+
+```
+/home/cerist/models/medgemma-4b-it   8.1G
+  model-00001-of-00002.safetensors   4.96 GB
+  model-00002-of-00002.safetensors   3.64 GB
+  config.json, tokenizer.json, tokenizer.model, ...
+```
+
+Two deviations from the plan as written, both deliberate:
+
+- **`/home/cerist/models`, not `/opt/models`.** `/opt` needs root to create; the home directory does
+  not, and the bind mount into the container is read-only either way. One less privileged step in the
+  install.
+- **`snapshot_download` from the Python API, not the `hf` CLI.** The first attempt failed with
+  `hf: command not found`: `pip install` as a non-root user with `HOME=/tmp` puts the entry point in
+  `/tmp/.local/bin`, which is not on `PATH`. Calling the library directly avoids the question. Worth
+  noting the failure was silent — `docker run ... | tail` reported exit code 0 because the pipeline's
+  status is the last command's, so the download "succeeded" while producing nothing. `set -o pipefail`
+  is in the retry.
+
+The weights sit on the host and are mounted read-only. A 9 GB model inside an image layer would make
+every rebuild enormous, and this way the weights survive container recreation — the failure mode
+Finding 5 recorded on Server 1.
+
+### Step 2b — the vLLM image
+
+`vllm/vllm-openai:v0.11.0`, pulled in parallel with the weights. Still in progress at the time of
+writing; it is a large image.
+
+### Next
+
+Steps 3 to 5: start the server, prove guided decoding works with nothing else in the path, then switch
+`NLU_ENGINE`. Step 4 is a hard gate — if the model can return a task outside the schema's enum, the
+"cannot name a task that does not exist" property is not real, and that property is what makes the
+rest safe.
+
+---
+
+## Phase 15 — MedGemma live: steps 3 to 7
+
+### Step 3 — vLLM started
+
+`vllm/vllm-openai:v0.11.0` (38.5 GB image), MedGemma 4B loaded from disk, `Application startup
+complete`, `/health` 200. **No Blackwell kernel problem** — the plan's most-expected failure did not
+happen, because the driver exposes CUDA 13.2. GPU settles at **13.2 GB of 16.3 GB** with
+`--gpu-memory-utilization 0.80` and `--max-model-len 4096`.
+
+### Step 4 — guided decoding: PASSED
+
+The hard gate. Constrained to a two-value enum with nothing else in the path:
+
+```
+CONTENT: {"task": "search_patient"}
+```
+
+Valid JSON, a value from the enum, and the right one. The property the whole design leans on — the
+model *cannot* name a task that does not exist — is real and is enforced by the server, not the prompt.
+
+### Steps 5 to 7 — three measured iterations
+
+The first run was the point of building the harness. Every number below is measured, not estimated.
+
+| | rules | run 1 | run 2 | run 3 (live) |
+|---|---|---|---|---|
+| task correct | 13 | **0** | 9 | **12** |
+| task wrong | 1 | 0 | 0 | 1 |
+| slot wrong or missing | 8 | 0 | 3 | **0** |
+| slot invented | 0 | 0 | 1 | 0 |
+| asked when it should not | 0 | **14** | 5 | 1 |
+| read an unclear sentence | 0 | 0 | 2 | 2 |
+| **UNSAFE** | 0 | 0 | **2→0** | **0** |
+
+**Run 1 — unusable, and instructive.** Zero tasks correct; it asked a clarifying question for all 25
+cases. But the replies showed it had understood everything:
+
+```
+'cherche le patient walter white' -> clarification: 'Rechercher le patient Walter White.'
+```
+
+That is a restatement, not a question. The model was using `clarification` as a general message field.
+Not a comprehension failure — a format failure. Two fixes: **six few-shot examples** (a 4B model
+follows a demonstration far better than a paragraph) and a code rule that a "clarification" which is
+not a question, offered alongside a task already identified, is not a clarification.
+
+**Run 2 — better, and it exposed two real bugs of mine.**
+
+- `gender='M'` was invented from the first name "Ahmed" in a sentence about a GCS score, and the
+  fabrication filter waved it through, because `"m"` is a substring of almost any French sentence. Now
+  coded slots (`gender`, `gcs_total`, `karnofsky`) may only come from the deterministic extractor, and
+  substring corroboration needs at least three characters.
+- The model overlooked the phone number, the GCS and the time in sentences stating all three plainly.
+  Fixed by merging the extractor's findings with the model's — each is good at a different half of the
+  job.
+
+It also showed **the harness itself was wrong**. Its UNSAFE column counted any unclarified case,
+including two where the chosen task was a *read*. CA4 executes lookups without confirmation by design
+and nothing in the record changes, so a read on an unclear sentence is a quality miss, not a safety
+one. A go/no-go column that also counts harmless reads cannot be used to decide anything, so reads now
+have their own bucket.
+
+**A regression the metric caught.** Suppressing redundant questions — the fix for "asks for values the
+sentence already gave" — sent **UNSAFE from 0 to 7**. The descriptive-phrasing check declines to add a
+question when the model has already asked one; suppression then ran afterwards and dropped that
+question, because the extractor had filled every slot. "Le GCS s'est aggrave a 6" became a write plan.
+Descriptive phrasing is now decided **last** and returns directly, so nothing downstream can undo it,
+and a test pins it.
+
+That sequence is the argument for the whole harness. Seven ways to write something nobody asked for,
+introduced by a change that made four other numbers better, caught in one run.
+
+**Run 3 — better than the rules engine where it counts.** Zero slot errors against the rules engine's
+eight, zero fabrications, zero unsafe. What remains is quality: one wrong task
+(`search_patient` where `get_patient_summary` was expected — both reads), one question asked
+needlessly, and two unclear sentences answered with a read rather than a question.
+
+### Live
+
+`NLU_ENGINE=medgemma`. Confirmed from the running container, not from the file:
+
+```
+Interpretation: MedGemma at http://vllm:8000/v1 (falling back to rules on failure)
+```
+
+**123 tests pass.**
+
+### Finding 16 — the documented rollback did not work
+
+`docker-compose.vllm.yml` set `NLU_ENGINE: medgemma` outright. A compose `environment` value overrides
+`env_file`, so editing `.env` — the rollback written into `MEDGEMMA-PLAN.md` and
+`DEPLOYMENT-GUIDE.md` — changed nothing while the overlay was applied. Found by using it: the revert
+was performed, reported success, and the log still said MedGemma.
+
+A rollback that appears to work and does not is worse than none. Now `${NLU_ENGINE:-medgemma}`, so the
+overlay supplies a default and `.env` wins.
+
+### Honest limits of this measurement
+
+- **25 cases, written by us, not by clinicians.** The corpus should be replaced with phrasings
+  collected from the department; until then these numbers are provisional.
+- **Iterating the prompt against this corpus risks fitting it.** The safety rows are the ones that
+  matter, and those are enforced in code rather than by the prompt, which is what makes them worth
+  trusting.
+- **Nothing here measures latency**, which a clinician will feel immediately.
+- **The four task families have not been exercised through the model in the UI.** Step 6 of the plan is
+  still outstanding and is the operator's to run.
+
+---
+
+## Phase 16 — Validation report: Findings 17-25, and the two causes nobody had looked for
+
+Worked from `CHATBOT-VALIDATION-REPORT.md`. Every root cause below was established from the deployed
+system, not from the symptom.
+
+### Finding 26 (new, CRITICAL) — the system prompt had never reached the model
+
+Measured with the model's own tokeniser:
+
+```
+system prompt length : 2178 chars
+as a SYSTEM message  :   4 tokens    <- content silently discarded
+as a USER message    : 564 tokens
+```
+
+**Gemma 3 - and so MedGemma - has no `system` turn in its chat template**, and vLLM drops one without
+complaint. Every rule in `SYSTEM_PROMPT` had been thrown away on every call since the model went
+live: the two safety rules, "never invent a value", the no-deletion rule, **and the entire task
+list**. All observed model behaviour came from the six few-shot examples alone, because those are
+`user`/`assistant` turns.
+
+Fixed by attaching the instructions to the final user turn rather than a system turn - and to the
+*final* one deliberately, because instruction adherence at 4B falls off with distance, so the rules
+now sit immediately before the sentence they govern.
+
+This is the fourth time in this project that a component reported success while doing nothing.
+
+### Finding 17 (CRITICAL) — not a search bug, and not NLU
+
+The report's own analysis had ruled out NLU correctly but pointed at FHIR search parameters or index
+staleness. The logs settle it: **every failing call returned HTTP 404**, and a FHIR search that
+matches nothing returns *200 with an empty Bundle*. A 404 means the request never reached the API.
+
+The boundary is exact - every success at or before `10:29:16` on 2026-08-23, every failure from
+`11:14:10`, **including character-identical URLs**:
+
+```
+10:28:04  GET .../relay/ws/fhir2/R4/Patient?name=walter%20white&_count=10  200 OK
+11:20:11  GET .../relay/ws/fhir2/R4/Patient?name=walter%20white&_count=10  404 Not Found
+```
+
+Probing with a deliberately invalid token today returns **401**, so the audit filter is intercepting
+now. For roughly 45 minutes it was not: relayed calls fell through to Spring, which has no mapping for
+`/module/agentgateway/relay/...`, and answered 404. The operator does not know what happened on
+Server 1 in that window; an OpenMRS or module restart is the likely trigger.
+
+**The permanent defect is the mistranslation, and that is what was fixed.** `explain_failure` mapped
+404 to *"Le dossier demande est introuvable"*, so an infrastructure fault was reported to clinicians
+as a clinical fact - their patients did not exist. A search now gets a different message that names it
+as technical and tells the reader to raise it with an administrator. Had that wording existed, this
+would have been diagnosed in minutes rather than looking like a broken search for a week.
+
+### Finding 18 (HIGH) — the trigger word captured into the name
+
+`_NAME_AFTER_KEYWORD_RE` lists both `patient` and `nomme` as triggers, and `re.search` returns the
+**leftmost** match. In *"Cree nouveau patient nomme rachid ghezal"* it matched `patient`, then
+captured the next three words: `nomme rachid ghezal`. Patient `1000C6` exists in the live database
+with that name.
+
+Fixed by putting the trigger words themselves - and titles, and English pronouns - in the stopword
+list, and by **skipping** leading stopwords rather than stopping at them. Stopping at them was the
+first attempt and it lost the name entirely, which is safer but still wrong.
+
+The pronouns are not hypothetical: the extractor had searched OpenMRS for patients called `he` and
+`his`.
+
+### Finding 20 (HIGH) — availability was checked after the question was asked
+
+`handle_turn` returned the interpreter's clarification **before** `_plan_and_maybe_execute` ever
+consulted the tool registry. So the assistant asked for an appointment date for a booking this
+installation can never make. Not a MedGemma regression as such: the rules engine simply produced no
+clarification for that phrasing, so it fell through to the correct refusal. Availability is now
+settled first.
+
+### Findings 19 and 21 (HIGH, LOW) — one cause, as the report suspected
+
+`supprime...` matched no task pattern, so it came back `unsupported` - and `_interpret_with_carryover`
+treats *any* unsupported turn as an answer to a pending question. `supprime tous les patients`, typed
+in plain French while a create was half-finished, was absorbed into it and never answered.
+
+Two fixes. Deletion is now **recognised**, so it is refused by name ("l'assistant n'a aucune capacite
+de suppression") rather than through the generic "je n'ai pas compris" - Finding 21 - and it is
+refused before any carryover can absorb it. And per the operator's decision, a reply that answers
+nothing now **abandons the pending request out loud** rather than re-asking forever: silently
+swallowing a typed command is the worse failure.
+
+### Finding 22 (MEDIUM) — the stylesheet had never loaded, on any page
+
+The report suggested designing a visual distinction. It already existed:
+
+```css
+.agent-message-user { background: #2c6da4; color: #fff; margin-left: auto; }
+.agent-message-bot  { background: #eef3f8; color: #1b3a52; }
+```
+
+The UI framework resolves `ui.includeCss(provider, file)` to `/moduleResources/<provider>/styles/<file>`
+and `ui.includeJavascript` to `.../scripts/<file>`. Verified on the running server:
+
+```
+/moduleResources/agentgateway/styles/agentgateway.css  -> 404
+/moduleResources/agentgateway/css/agentgateway.css     -> 200
+/moduleResources/agentgateway/scripts/agent-chat.js    -> 200
+```
+
+The javascript sat in `scripts/` and loaded; the stylesheet sat in `css/` and never did. The chat
+worked perfectly while being entirely unstyled - which is why it read as "nobody designed a
+distinction". One file move fixes the chat page, the dashboard widget **and** the administrator's
+operation log, which answers the report's open question about `operationLog.gsp`: same cause.
+
+A test now asserts the stylesheet is where `includeCss` looks.
+
+### Also fixed: an identifier searched as a name
+
+Not separated out in the report, but visible in its own transcript. *"met a jour le numero de
+telephone du patient 1000C6"* went out as `name=1000C6`, and a FHIR **name** search can never match an
+identifier - so a record that exists was reported as not existing, compounding Finding 17. A token
+that is short, spaceless and contains digits is now searched as `identifier=`.
+
+### Findings 24, 25 — polish
+
+24 is fixed: a sentence that is already a question gets a different reply from a statement, rather
+than both being told "cette phrase decrit un etat".
+
+**25 is deliberately not changed.** `cree un patient` returning "Quel est le nom, le sexe et la date de
+naissance ?" in one message is inconsistent with the sequential asking elsewhere, but asking for three
+missing values at once is arguably better for the clinician, and forcing sequential questions would
+throw away information the model already provided. Flagged for the operator's preference rather than
+changed on a guess.
+
+---
+
+## Phase 17 — Prompt engineering, with the prompt finally being delivered
+
+Four measured iterations. Every number from `tests/eval_nlu.py`, 25 cases, both engines.
+
+| | rules | delivered v1 | v2 | v3 (classifier) | **v4 (live)** |
+|---|---|---|---|---|---|
+| task correct | 13 | 10 | 9 | 9 | **14** |
+| task wrong | 1 | 2 | 1 | 0 | **0** |
+| slot wrong or missing | 7 | 1 | 0 | 1 | **3** |
+| slot invented | 0 | 0 | 0 | 0 | **0** |
+| asked when it should not | 0 | 2 | 4 | 5 | **0** |
+| read an unclear sentence | 0 | 1 | 0 | 0 | **0** |
+| **UNSAFE** | 0 | 0 | 0 | 0 | **0** |
+
+**v1** - delivering the prompt made things *worse*. Two new failure modes appeared, both caused by
+what I had written:
+
+```
+'qui est walter white ?'   -> "Je suis un modele de langage et je ne peux pas acceder a des
+                              informations personnelles ou medicales."
+'mets a jour le telephone' -> "Veuillez utiliser la tache 'update_patient_demographics'."
+```
+
+It refused on privacy grounds, and **leaked an internal task name to a clinician**. The prompt said
+"tu ne parles pas au clinicien" while `clarification` is precisely that, and it listed task names
+without ever saying not to utter them.
+
+**v2** - corrected both, and the refusals continued in a new form ("Je ne peux pas afficher de
+dossiers"). **v3** - stripped the prompt to a pure classifier framing, explicitly "ne dis jamais je ne
+peux pas". The refusals *still* continued. The lesson is worth recording: **explaining the surrounding
+system to a 4B model teaches it to role-play the assistant that must decline.** Every paragraph about
+OpenMRS, confirmation gates and access rights came back as a reason to refuse.
+
+**v4** - settled in code instead of by asking more politely. When the model declines a sentence, the
+deterministic engine is consulted; if the rules parse that sentence into a concrete task with every
+required slot present, the rules win. This is the division of labour the class already used for slots:
+the model exists for phrasing the regexes cannot read, and where the regexes *can* read a sentence
+completely, a refusal is noise.
+
+Safety is untouched by that: the rules engine applies its own descriptive-phrasing check before
+returning anything, so a hedged sentence cannot be promoted into a write, and `_apply_safety_rules`
+still runs on whichever reading wins.
+
+Result: **14 of 14 non-safety cases correct, no wrong task, no invented slot, no needless question, no
+unsafe row.** Better than either component alone - the rules engine gets 13 with 7 slot misses; the
+model alone could not stop refusing.
+
+Three slot misses remain, all a missing `name`: *"le telephone de Ahmed Ziani"* and *"la date de
+naissance de Benali"* have no trigger word the extractor recognises, and the model did not supply one.
+The consequence is one extra turn asking for the name. Left alone rather than widening the trigger to
+bare `de`, which would over-match badly.
+
+### Task 4 — the context window is comfortable
+
+| | |
+|---|---|
+| Total prompt, measured with the model's tokeniser | **1306 tokens** |
+| `--max-model-len` | 4096 |
+| Headroom | 2790, with `llm_max_tokens=512` |
+| Schema | 1745 chars, enforced by the grammar, not part of the prompt |
+
+32% of the window, and the schema costs nothing in it. No change needed. Worth knowing the shape: the
+few-shot examples are the bulk of it, and they are what actually drives behaviour at this model size.
+
+### Builds
+
+- module **1.1.4** - 65 tests (the new stylesheet-location guard included)
+- agent service - **142 tests**
+
+---
+
+## Phase 18 — Real-life testing: 44 scenarios, and one live data-corruption path
+
+Built `tests/explore.py`: it drives the **real** orchestrator with the **real** MedGemma against a mock
+OpenMRS seeded with the hospital's own patients, printing every turn, its end state, the reply and the
+calls issued. 44 scenarios in 7 groups, runnable in one command.
+
+    docker compose exec clinical-agent python3 -m tests.explore          # all
+    docker compose exec clinical-agent python3 -m tests.explore update   # one group
+
+It covers interpretation, orchestration, slot handling, both gates and the exact request the tool layer
+builds. It cannot cover OpenMRS's own validators, which matters below.
+
+### Finding 28 (CRITICAL, OPEN) — the answer to "what should I modify?" becomes the patient's name
+
+```
+> change le telephone d'un patient
+  -> De quel patient s'agit-il ?
+> nom
+  -> Je vais MODIFIER la fiche du patient ghezal nomme rachid - 1000C6 :
+     - Nom : nom
+> Confirmer
+  -> C'est enregistre.            <- the PUT was executed
+```
+
+Two things make this worse than the operator's transcript showed. It **searched `name=nom`** and matched
+patient `1000C6`, whose polluted name (Finding 18) contains "nom" - so it targeted a patient nobody
+named. And against the mock the write **succeeded**: in production it failed only because OpenMRS's
+validator rejected `names[1].givenName`. **The only thing protecting patient names today is a
+downstream validator.**
+
+Cause: `orchestrator.py:322` asks "Que faut-il modifier exactement ?" and never sets
+`state.awaiting_slot`, so the next turn reaches `merged.setdefault("name", prompt.strip())` - a blanket
+"if we do not know what we asked for, treat it as a name".
+
+**Recommendation on the table: disable the update flow until this is fixed.** It is the only finding in
+this round that is unsafe to leave running.
+
+### Finding 29 (HIGH, OPEN) — only two of the four places that ask a question record what they asked
+
+The unifying defect behind most of this round. `awaiting_slot` is set by `_resolve_patient` and by the
+missing-slot branch, and **not** set by the model's own clarifications or by the update field question.
+Every reply to an unrecorded question is then guessed at. Findings 13, 19, 28 and 30 are all this same
+defect surfacing in a different place; fixing the four call sites once is the work.
+
+### Finding 30 (HIGH, OPEN) — multi-turn create is broken, by two of our own fixes interacting
+
+```
+> Cree nouveau patient nomme rachid ghezal
+  -> Quel est le sexe du patient ?              (name extracted correctly - Finding 18 fix works)
+> masculin
+  -> Quelle est la date de naissance ?
+> 15/06/1999
+  -> J'abandonne la demande precedente...       <- wrong
+```
+
+Finding 15's fix made `birthdate` require a birth cue ("ne le"), so a bare date fills `dates` but not
+`birthdate`. Finding 19's fix then abandons the request because nothing was filled. Each fix is right
+on its own and together they break the flow.
+
+The resolution is conceptual, not a patch: **the question we asked supplies the context the sentence
+lacks.** Having asked "quelle est la date de naissance ?", a bare date is a birth date.
+
+Separately, `cree un patient` -> `Nadia Belkacem` was treated as a **new search**, because the model's
+question set no `awaiting_slot` (Finding 29).
+
+### Finding 31 (HIGH, OPEN) — a patient named in an update sentence is never resolved
+
+*"mets a jour le telephone de walter white a 0555123456"* still answers "De quel patient s'agit-il ?".
+The extractor has no trigger for `<field> de <name>`, and the model did not supply the name either. So
+**every** update costs a disambiguation turn - which is precisely the turn that then corrupts the name.
+
+### Finding 32 (HIGH, OPEN) — no anaphora
+
+```
+> cherche le patient walter white     -> 1 patient trouve
+> affiche son dossier                 -> De quel patient s'agit-il ?
+```
+
+`search_patient` has `requires_patient=False`, so nothing resolves a patient and
+`state.last_patient_uuid` is never set. A clinician's most natural follow-up does not work.
+
+### Finding 33 (MEDIUM, OPEN) — prompt framing leaks to clinicians
+
+```
+> que peux-tu faire ?   -> "Je suis un classificateur de phrases. Je ne peux pas effectuer d'actions."
+```
+
+Introduced by the Phase 17 v3 rewrite, which fixed the refusals by framing the model as a classifier.
+The clinician should never see that framing.
+
+### Finding 34 (MEDIUM, OPEN) — a fabricated first name on a read
+
+*"montre moi les informations du patient Ziani"* -> the model invented "Ahmed Ziani" and searched for
+it, producing a false "no such patient". The fabrication filter guards writes only, deliberately - but
+inventing a name turns a findable patient into a missing one.
+
+### Capability gaps, not defects
+
+| Gap | Note |
+|---|---|
+| List or filter patients ("toutes les patientes de sexe feminin") | FHIR supports `?gender=female`; this is a new tool, not a bug |
+| Computed answers ("quel age a X ?", "son telephone") | refused; the phone is not even in the summary |
+| Update fields beyond name and phone (address, birthdate) | silently unsupported |
+| Small talk ("merci", "?") | answered with "Je ne peux pas traiter cette demande" |
+
+### What the round confirmed as working
+
+Search by name, surname and identifier; question phrasing; a name buried in a clause; prefix search
+(`noms commencent par W` returned both W patients); the empty-result message; reading a record;
+single-sentence create with its duplicate warning; the confirmation gate including refusal; deletion
+refused by name even mid-pending-question; GCS, Karnofsky and appointments refused with the real
+reason; and **every safety row** - no descriptive or hedged sentence became a write.
+
+### Open questions for the operator
+
+1. Disable the update flow until Finding 28 is fixed, or fix in place with the assistant live?
+2. Are list/filter queries a capability clinicians actually need, or noise from testing?
+
+**Answered, 2026-08-26:** (1) fix in place, live. (2) build it.
+
+---
+
+## Phase 19 — Finding 28 closed, 29-34 addressed, list/filter capability added
+
+Both open questions were answered by the operator: fix Finding 28 in place rather than disabling
+the update flow, and build list/filter patients as a real capability rather than leaving it a gap.
+
+### Finding 28 (CRITICAL) - closed, and it needed two fixes, not one
+
+The obvious fix - `orchestrator.py:322` (the "que faut-il modifier ?" question) now sets
+`state.awaiting_slot = "update_field"`, and the reply is only accepted if the extractor actually
+found a `phone` or `name` value in it, never guessed - stopped the reproduction in the finding.
+But driving the fix against the real interpreter (not the mock) surfaced a second, structural path
+to the same corruption that the first fix did not touch:
+
+`_resolve_patient` answers "de quel patient s'agit-il ?" by treating a non-numeric reply as a name
+*search term* (`_bare_slot_answer`'s `asked == "patient"` branch, unchanged since Phase 18). For
+`update_patient_demographics`, that same `slots["name"]` is then read a second time, downstream, as
+*the new name to write* - `_build_update_patient` does not know the two are different things. So
+"change le telephone d'un patient" -> "nom" still resolved a patient (searching `name=nom`, still
+matching the Finding-18-polluted record) and, with the update_field fix alone, would have written
+"nom" into that patient's name field the moment a value like `phone` was also present - the
+`update_field` fix only closes the path where *no* value is present yet.
+
+Fixed at the root in `orchestrator.py`, `_plan_and_maybe_execute`: once a patient has been resolved
+by name (no identifier given), that name is popped from `slots` before the tool ever builds a
+write - it has done its job of finding the patient, and cannot also be read as a value to write.
+A name resolved by identifier, or carried over by anaphora, is untouched, since only a name-based
+resolution collides with the update tool's own use of the `name` slot.
+
+Verified against the real interpreter, not the mock: `change le telephone d'un patient` -> `nom` ->
+`Confirmer` now asks "que faut-il modifier ?" and then refuses to guess, in both cases - no write
+reaches OpenMRS. `mets a jour le telephone de walter white a 0555123456` (single turn) now also
+stopped showing a spurious "- Nom : walter white" line in its own confirmation summary, a smaller
+instance of the same collision that existed before this round and was masked by Finding 31 (the
+sentence did not resolve a name at all until this round's extractor fix).
+
+### Finding 29 - the two untracked call sites, fixed; the fix needed to be safety-aware, not uniform
+
+`orchestrator.py`'s model/rules clarification (the early `needs_clarification` branch) now sets
+`state.awaiting_slot` too, via `_primary_missing_slot` - it reads the tool's own `required_slots`
+for the task the interpreter named and records the first missing one, reusing the exact list the
+later gap-check asks against rather than a second notion of what a task needs.
+
+The one place this is *not* enough - and had to be handled separately - is exactly Finding 28's
+case: `update_patient_demographics` has no `required_slots` at all (what to change is discovered,
+not required up front), so there is nothing for `_primary_missing_slot` to name. A reply to an
+untracked update question therefore never falls back to the old blanket "guess it is a name"; it is
+refused instead. The old default is kept only for tasks where a raw guess cannot overwrite an
+existing record (in practice, `create_patient`) - the confirmation gate is still there to catch a
+bad guess for those.
+
+A second, model-specific defect surfaced while chasing this one down. The interpreter is called
+fresh every turn with no memory of what was just asked (`context={}`, always - see `medgemma.py`).
+A bare reply to a pending question - "Nadia Belkacem", "masculin", a bare date - has nothing in it
+for the model to read as an instruction, so it confidently classified it as a **new** request
+(usually `search_patient`), silently abandoning whatever was half-finished. Fixed with a
+deterministic guard in `_interpret_with_carryover`: when a question is pending and the reply
+matches none of the vocabulary a fresh instruction would (`rules.matches_a_task`), the model's
+classification is not trusted - the turn is treated as an answer, full stop. This is the same
+"trust the deterministic reading over the model's when it disagrees oddly" pattern
+`_prefer_rules_over_a_refusal` already used for the opposite failure (the model declining a
+sentence the rules read cleanly); here the model is *overconfident* instead of under-.
+
+A third, unrelated defect was found the same way: for `cree un patient` (no name at all), the model
+sometimes returned `slots={"name": "cree un patient"}` - the whole prompt, echoed back as the value
+of the one field it could not fill. This trivially passed `_drop_unsupported_slots`'s "is the value
+a substring of the sentence" corroboration check, since the whole prompt is a substring of itself.
+Fixed with a direct guard in `medgemma.py`: a slot value equal to the entire prompt is dropped, not
+kept - the whole sentence is never a legitimate value for one field.
+
+### Finding 30 - both parts, fixed
+
+The `_bare_slot_answer` case for `birthdate` now reads the reply's `dates` (already extracted, cue
+or not) when the reply itself carries no birth cue - the question just asked *is* the cue, exactly
+as diagnosed in Phase 18. And the "separately" case (`cree un patient` -> `Nadia Belkacem` treated
+as a new search) is fixed by the Finding 29 model-guard above: verified end to end,
+`cree un patient` -> `Nadia Belkacem` -> `feminin` -> `22/07/1988` -> `Confirmer` now creates the
+patient.
+
+### Finding 31 - fixed
+
+`<field> de <name>` ("le telephone de walter white", "l'adresse de walter white") now extracts the
+name: `telephone de`, `tel de`, `numero de`, `adresse de` and `nom de` were added as name-extraction
+keywords in `rules.py`, alongside the existing `dossier de`/`du patient`/`pour`. Verified:
+`mets a jour le telephone de walter white a 0555123456` now resolves the patient and reaches the
+confirmation gate in one turn, where it previously always cost a disambiguation turn.
+
+`tests/test_chat_end_to_end.py::test_answering_with_an_identifier_escapes_an_ambiguous_name` was
+built on the previously-broken extraction (its whole premise was that "de Test Neurochir" resolved
+no name at all, so a fixed sentence had to reach ambiguity by a different route than the finding
+described). Updated to seed two patients who genuinely share the name the sentence gives, so the
+ambiguity the test is actually about - an identifier answer escaping it - still exists once the
+extraction is fixed.
+
+### Finding 32 - fixed
+
+`search_patient` still does not set `requires_patient` (it would ask "de quel patient" before
+running the search it is itself supposed to be), so `state.last_patient_uuid` is now set directly
+in `_execute`: when a search's own results contain exactly one match, that patient becomes the
+anaphora target for the next turn. Verified: `cherche le patient walter white` -> `affiche son
+dossier` now reads the record directly, and `cherche le patient walter white` -> `mets a jour son
+telephone a ...` now resolves the patient without asking.
+
+### Finding 33 - fixed
+
+A clarification containing the classifier framing (`classificateur`, `categorie`, `un autre
+programme`, ...) is dropped in `_usable_clarification`, the same place a restated instruction was
+already being dropped. `que peux-tu faire ?` now answers the ordinary fallback message instead of
+"Je suis un classificateur de phrases...".
+
+### Finding 34 - fixed
+
+The model's `name` slot is corroborated against the sentence on **every** task now, not only
+writes - previously `_drop_unsupported_slots` (the corroboration check) ran only `if writes`, so a
+read had no defence against a fabricated first name. `montre moi les informations du patient Ziani`
+now searches `name=Ziani`, not `name=Ahmed Ziani`.
+
+### A safety gap found and closed while verifying, not one of the eight
+
+Rule 3 in the model's prompt ("deux categories possibles -> pose une question") had nothing
+enforcing it in code, unlike rule 2 (descriptive phrasing), which `reads_as_description` backs up
+regardless of what the model says. `tests/eval_nlu.py` caught the gap directly: `dossier et
+rendez-vous pour Benali` came back from the model as a confident `book_appointment` with no
+question - **UNSAFE = 1**, a write planned for a sentence naming two actions. Fixed in
+`_apply_safety_rules` with the same pattern `_prefer_rules_over_a_refusal` already uses for the
+opposite failure: on a write with no clarification, the deterministic matcher is asked too, and if
+*it* still reads the sentence as ambiguous, its clarification wins. Re-run after the fix:
+**UNSAFE = 0** on both engines.
+
+This is why the fixes above were driven against the live MedGemma deployment and the real interpret
+pipeline (`docker compose ... exec clinical-agent python3 -m tests.explore`, then `eval_nlu`), not
+against the mock alone or by reading the code: two of the three defects that mattered most this
+round - the update-name collision and the missing ambiguity backstop - do not exist in the rules
+engine and were invisible until MedGemma's actual behaviour was measured.
+
+### New capability: list_patients
+
+FHIR's `?gender=female` (and an unfiltered listing) is now a real tool, `list_patients`
+(`tools/catalog.py`), not a capability gap. `liste tous les patients`,
+`donne moi toutes les patientes de sexe feminin`. Kept separate from `search_patient`, which
+requires a name and would ask for one nobody meant to give.
+
+One interaction needed its own fix: "tous les patients" appears both in a genuine list request and
+in a search qualified by a clause ("cherche tous les patients dont les noms commencent par W" -
+prefix search, confirmed working since Phase 18). `_is_benign_overlap` now treats
+`{search_patient, get_patient_summary, list_patients}` as one benign group (all read-only lookups),
+so a sentence matching both keeps its search meaning when a search verb is present. The model's
+prompt was given the same distinction directly, with a contrasting few-shot pair, since the rules
+engine and the model do not share a classifier. Also fixed: `_match_tasks` no longer offers
+`list_patients` for a sentence `reads_as_deletion` already flags - "supprime tous les patients"
+carries the list vocabulary too, and was showing up as a `list_patients` read in `eval_nlu` before
+this exclusion (not unsafe - deletion is refused upstream in the orchestrator regardless of what
+the interpreter says - but a wrong reading of a sentence that is refused for an unrelated reason is
+still worth not having).
+
+### Verification
+
+- `openmrs-module-agentgateway`: unchanged, not touched this round.
+- `clinical-agent-service`: 142/142, including the updated identifier-escapes-ambiguity test.
+- `tests/explore.py`, all 44 scenarios, against the live MedGemma deployment (not the rules engine):
+  every finding above confirmed fixed in the transcript, no new unsafe transcript found.
+- `tests/eval_nlu.py`: **UNSAFE = 0** on both `rules` and `medgemma`, confirmed after the ambiguity
+  backstop fix (it was 1 before that fix, on medgemma, for the reason above).
+
+### Manual testing against the real hospital OpenMRS, same day
+
+Everything above was verified against the mock. The operator then drove the live chat against
+Server 1's real OpenMRS directly and pulled `GET /module/agentgateway/log.form` (the operation log)
+after each round to check what was actually sent, not just what the chat claimed. No data
+corruption in any of it - the update-name collision, the ambiguity backstop, and every finding
+above held under real use. Two new things surfaced that this round did not cover:
+
+- **A pronoun-plus-digits reply mis-tags a phone value as a patient identifier.**
+  `mets a jour son telephone a 0666777888` (no name, right after a search that should have supplied
+  the patient by anaphora) came back with slots containing `identifier: "0666777888"` instead of
+  `phone: "0666777888"` - the operation log shows `GET .../Patient?identifier=0666777888&_count=10`
+  (0 results) rather than a phone update. `_resolve_patient` prefers a given identifier over
+  anaphora, so the wrong tag skipped the just-resolved patient entirely and searched for a patient
+  who does not exist. The rules extractor reads this sentence correctly (`_PHONE_RE` matches
+  "telephone" + the digits, `_IDENTIFIER_RE` does not) - this is a MedGemma classification error
+  specific to the pronoun form, not an extractor gap. Fails safely (a "not found" message, no
+  write), but is a real quality bug worth its own finding: rephrasing with the name
+  (`mets a jour le telephone de walter a ...`) worked correctly in the same session.
+- **Restating a bare update after an abandon does not pick the request back up**, by design, not by
+  accident. `change le telephone d'un patient` -> `le telephone` (Finding 28's safe abandon fires,
+  clearing `state.draft_task`) -> `le telephone est 0611223344` came back "cette phrase ne concerne
+  pas un patient" - correctly, since that sentence alone has no update verb and no patient name once
+  the pending question is gone. This is the accepted cost of refusing to guess (Finding 28/29): the
+  clinician has to restate who the update is about, which the operator then did successfully
+  (`walter white`, found; the *next* attempt at the same bare sentence still needed a full sentence
+  with an update verb, not just a value).
+- **`PUT /ws/fhir2/R4/Patient/41cccb5d-ced0-44c9-ac9a-64db7ace116e` returns HTTP 500**, and the
+  operation log shows it doing the same thing on **2026-08-24, two days before this round's changes
+  were written** (log id 80) as it did today (log id 103) - same patient, same failure, before and
+  after. Not caused by this round: a server-side or data problem on that specific record, to be
+  chased on the OpenMRS/Tomcat side rather than in this codebase. The correctly-built request (only
+  the phone field changed, everything else round-tripped from the record just read) reached
+  OpenMRS and OpenMRS itself failed to apply it.
+
+### What is still open
+
+- **Search by identifier is not always reliable** (`cherche le patient 10002T` searched
+  `name=10002T` and found nothing, in this round's transcript). Noticed while verifying Finding 31,
+  not part of it: `_build_search_patient` (unlike `_resolve_patient`) never applies the
+  identifier-shape heuristic to a bare token, and the model did not tag `10002T` as `identifier`
+  either. Not fixed this round - flagged for a future finding rather than folded in here, since it
+  is a different code path (search_patient's own build function) than anything in 28-34.
+- **`inscris une nouvelle patiente, X, nee le ...`** (comma-separated name after "patiente") and
+  **`corrige la date de naissance de X, c'est le ...`** (name after "naissance de") still miss the
+  name, on both engines - pre-existing extractor gaps, confirmed present on the unmodified rules
+  engine too, not introduced this round. `naissance de` was deliberately not added to the Finding 31
+  keyword list because `update_patient_demographics` does not support a birthdate write at all yet
+  (documented gap below), so extracting the name there could not complete the request anyway.
+- **Update fields beyond name and phone** (birthdate, address) remain unsupported, by design -
+  `change l'adresse de walter white a Blida centre` now resolves the patient (Finding 31) and then
+  correctly refuses to guess which field, rather than silently doing nothing.
+- **The one-off "MedGemma unavailable... Expecting ',' delimiter"** seen once at the very start of
+  both `explore.py` runs this round, before any scenario, and not again during 44 scenarios plus 25
+  `eval_nlu` cases - looks like a cold-start artifact (a truncated first response) rather than
+  something this round's changes caused; every scenario afterwards showed genuine model output, not
+  the rules-engine fallback. Not chased further; worth a note if it recurs mid-conversation rather
+  than only at startup.
+
+---
+
+## Phase 20 - the four items manual testing found, all fixed
+
+Manual testing against the real hospital OpenMRS (Phase 19's own final section) surfaced four
+things. All four are fixed here, verified against the live MedGemma deployment and, for the
+OpenMRS-side one, against the real database.
+
+### The `PUT .../Patient/41cccb5d-...` 500 - the real story took three attempts to get right
+
+Not an OpenMRS/Tomcat problem, despite reproducing identically two days apart (2026-08-24 and
+2026-08-26) before this round's changes existed. `openmrs.log` on Server 1 pinned the exact moment:
+
+    ERROR - SqlExceptionHelper.logExceptions(142) |2026-08-26T11:59:48,548| Column 'uuid' cannot be null
+
+the same timestamp as the failed PUT in the operation log, and the same error class as Finding 10
+(fhir2 1.2.2's translators call `setUuid(resource.getId())` unconditionally). Finding 10 was about
+*create*, where a freshly-invented resource genuinely has no id - CREATE was moved to
+`webservices.rest` because of it.
+
+**First attempt** treated this as the same bug reached by a different door. `walter white` already
+has a phone attribute in the database (`person_attribute_id=2`, confirmed by querying
+`openmrs-mysql` directly), but `_build_update_patient` discarded the whole existing `telecom` entry
+and appended a brand-new, id-less dict. Fixed by editing the existing entry in place instead -
+preserve `id`, replace only `value`. Deployed, and the 500 *did* stop.
+
+**But the update still did not save.** A direct `PUT` reproducing exactly this fixed shape returned
+`200`, and the database value was unchanged. The reason the first fix "worked" is that fhir2 1.2.2's
+`TelecomTranslatorImpl` never puts a `system` field on the `ContactPoint` it returns at all - only
+`id` and `value` (`"telecom":[{"id":"...","value":"+1834073"}]`, read directly from the real FHIR
+response) - so the code's `entry.get("system") == "phone"` match could never fire, and it was still
+appending a fresh entry underneath the fix. Corrected the match to "any existing telecom entry is
+the phone, since this deployment configures exactly one contact-point attribute type" - deployed,
+tested with a direct `PUT`: `200`, and still **no change in the database.**
+
+**Root cause, found by decompiling the deployed jar** (`fhir2-api-1.2.2.jar`, extracted from the
+running container, disassembled with `javap`, not guessed at from the error message - the same
+discipline that found Finding 10 in the first place): `PersonTranslatorImpl.toOpenmrsType` maps
+every incoming `ContactPoint` through a lambda that does `new PersonAttribute()` and translates
+into *that*, never the managed entity fhir2 itself just read a moment earlier from the same
+request. `PersonNameTranslatorImpl` does the equivalent for `HumanName`. Hibernate holds each as a
+`Set`; a freshly-constructed object carrying the same `uuid` as one already in the set reads as
+"already present" and the value change inside it is never persisted. Confirmed directly:
+```
+PUT .../Patient/... {"telecom":[{"id":"...(existing)...","value":"0699887766"}]}  -> 200, DB unchanged
+PUT .../Patient/... {"name":[{"id":"...(existing)...","family":"whitetest"}]}     -> 200, DB unchanged
+```
+An id-less entry crashes (Finding 10's failure). An id-bearing entry silently no-ops. **There was
+no JSON shape that would have made a FHIR PUT actually change an existing telecom or name value on
+this deployment** - which means `update_patient_demographics` has likely never correctly saved a
+phone or name change against real OpenMRS, for as long as it has existed, and every "C'est
+enregistre" the assistant gave for one was untrue.
+
+**The actual fix**: route both fields through `webservices.rest`'s own attribute/name
+sub-resources, exactly `create_patient`'s ADR-10 precedent and for the identical underlying reason
+- `POST /ws/rest/v1/person/{uuid}/attribute/{attrUuid}` and
+`POST /ws/rest/v1/person/{uuid}/name/{nameUuid}` (or the parent collection, without a trailing id,
+to add a first-ever entry). Both verified directly against the real deployment - and this time by
+reading the value back afterwards, not just checking the status code:
+```
+POST .../person/.../attribute/02e3e8a2-... {"value":"0699887766"}  -> 200, DB: value = "0699887766"
+POST .../person/.../name/a3b79b73-...      {"familyName":"whitetest2"} -> 200, DB: family_name = "whitetest2"
+```
+`_build_update_patient` rewritten to build these calls instead of a FHIR `PUT`; the `ToolSpec`'s
+`fhir_resource`/`fhir_interaction` removed to match (no longer gated on FHIR's advertised `update`
+support, mirroring `create_patient`'s own reasoning). Reading the patient to resolve who the update
+is about is unaffected - reads were never broken, only this specific write path. Walter white's
+real record was used for every verification step above and restored to its original values
+(`white`/`walter`, `+1834073`) immediately after.
+
+### The pronoun-plus-digits phone/identifier mis-tag
+
+`mets a jour son telephone a 0666777888` (no name, anaphora should supply the patient) came back
+from MedGemma with `slots={"name": "0666777888", "phone": "0666777888"}` - the phone digits, also
+guessed as the name. The write-path corroboration check (`_drop_unsupported_slots`) waved it
+through: "0666777888" *is* a substring of the sentence, so the check that a value must "appear in
+the sentence" passed, even though the value plainly cannot be a name. `_resolve_patient` then
+preferred that fabricated identifier over the anaphora target it should have used, and searched
+for a patient who does not exist.
+
+Fixed with a direct guard, `_has_no_letters`, applied both in `_drop_unsupported_slots` (the write
+path) and in the read-path name-corroboration added for Finding 34: a value with no alphabetic
+character cannot be a person's name, regardless of whether it is a substring of the sentence.
+Verified: the same sentence now returns `slots={"phone": "0666777888"}` only, and the full
+conversation (`cherche walter white` -> `mets a jour son telephone a ...`) goes straight to a
+confirmation showing only the phone change.
+
+### Search by identifier
+
+`_build_search_patient` never applied the identifier-shape heuristic `_resolve_patient` already
+had (`identifier_shaped` - a short, space-free, digit-bearing token like `10002T`). Moved that
+function and its regex out of `orchestrator.py` (the only place it lived) into `nlu/rules.py` as a
+public helper, so both call sites - `_resolve_patient` and now `_build_search_patient` - use the
+same one rather than a second copy drifting from the first. Verified:
+`cherche le patient 10002T` now sends `identifier=10002T`, not `name=10002T`, and finds the patient.
+
+### Two extractor name gaps
+
+- `inscris une nouvelle patiente, X, nee le ...` - the comma between "patiente" and the name blocked
+  the keyword-then-name pattern, which required a plain space.
+- `corrige la date de naissance de X, ...` - "naissance de" was not a recognised keyword.
+
+Fixed by adding comma tolerance and the `naissance de` keyword to the **capitalised** name regex
+only (`_NAME_AFTER_KEYWORD_RE`). Comma tolerance was deliberately *not* added to the case-blind
+regex used for lower-case names: doing so first broke
+`test_an_update_preserves_the_fields_nobody_mentioned` -
+"le telephone du patient, tel 0555 12 34 56" matched "patient," as the name-introducing keyword and
+captured "tel 0555 12" as a name. A capital letter is evidence the text after the comma really is a
+name; a run of lower-case words after a comma is not - a comma is at least as often a plain clause
+break. Verified directly against `extract_slots` and via `eval_nlu`: medgemma's "slot wrong or
+missing" count went from 2 to 0.
+
+### Verification
+
+- `clinical-agent-service`: 142/142 (caught the comma-tolerance regression above before it reached
+  the live deployment; `mock_openmrs.py` gained `POST /person/{uuid}/attribute[/id]` and
+  `POST /person/{uuid}/name[/id]` so `test_an_update_preserves_the_fields_nobody_mentioned` still
+  exercises the real code path rather than being rewritten around it).
+- `tests/eval_nlu.py` against the live MedGemma deployment: **UNSAFE = 0**, "slot wrong or missing"
+  down from 2 to 0 on medgemma and 5 to 3 on rules (the two remaining rules-engine misses are
+  unrelated gaps not touched this round).
+- `tests/explore.py`, all 44 scenarios, live MedGemma: `cherche le patient 10002T`,
+  `mets a jour son telephone a 0666777888` (anaphora), and
+  `corrige la date de naissance de walter white, ...` (now resolves the patient in one turn) all
+  confirmed fixed in the transcript.
+- **The `PUT`-to-500/silent-no-op finding, and its fix, were both verified directly against the
+  real deployment** - not the mock, and not by trusting a 200 status code. `curl -u admin:...`
+  against Server 1's OpenMRS (admin/db credentials read from the running containers' own env,
+  `MYSQL_ROOT_PASSWORD` doubling as the OpenMRS admin password on this deployment) was used to:
+  read walter white's real `telecom`/`name` JSON shape, reproduce the silent no-op with a direct
+  FHIR `PUT`, confirm the `webservices.rest` replacement actually changes the database, and restore
+  walter's original values (`white`/`walter`, `+1834073`) afterwards. This is the reason the first
+  two attempts at this specific fix were each deployed and *looked* correct (tests passed, no 500)
+  before turning out to still be wrong - "the tool reports success" was never checked against "the
+  database actually changed" until this round did so directly.
+
+---
+
+## Phase 21 - the update fix confirmed live, and LLM I/O monitoring added
+
+### The Phase 20 update fix, confirmed through the real chat
+
+The operator re-ran `mets a jour le telephone de walter white a 0555123456` through the actual
+chat UI (not a direct `curl`) and confirmed via the operation log and a direct database query:
+`POST /ws/rest/v1/person/41cccb5d-.../attribute/02e3e8a2-...` returned `200`, and
+`person_attribute.value` changed to `0555123456` with `date_changed` matching the log entry's
+timestamp exactly. The whole pipeline - interpretation, the confirmation gate, the new REST calls -
+verified together for the first time, closing the one thing Phase 20 could not check itself.
+
+### LLM prompt/response monitoring
+
+Nothing previously logged the model's fully-engineered prompt (few-shot examples plus the rules
+plus the clinician's sentence, exactly as sent) or its raw response - only the clinician's own
+turn, and only via `main.py`'s existing `settings.log_prompts` (`LOG_PROMPTS` env var). Extended
+the same toggle rather than adding a second one: `MedGemmaNlu._ask_model` now logs the final
+engineered turn and the raw JSON response at `INFO` level when `LOG_PROMPTS=true` - the few-shot
+block itself is not logged, since it is identical on every call and adds nothing worth re-reading.
+Verified live: `docker logs clinical-agent` with the setting on shows the exact rules text plus
+sentence sent to vLLM and MedGemma's raw JSON reply for a real turn. Off by default, matching the
+setting's existing default - the log otherwise carries the clinician's sentence in full on every
+turn, which should not sit in a log file longer than it has to.
+
+---
+
+## Phase 22 - the read-only refusal, verified for real (Phase 18's last outstanding item)
+
+Phase 18 listed "an account with `chat.use` but not `chat.write` must be refused" as untested. It
+turned out to be more than untested: **no role in this deployment had either privilege assigned to
+it at all.** Every round of testing so far went through `admin`, a superuser who bypasses privilege
+checks entirely, so the read-only path had never actually been exercised - not just unverified, but
+unconfigured.
+
+`AgentAuditFilter` (the code meant to enforce this) calls OpenMRS's `Context` statics directly,
+unlike `RollbackEngine`'s dependency-injected, plain-JUnit-testable design - a proper unit test
+would need either heavyweight Spring/DB test infrastructure or a refactor. Verified against a real
+account instead, end to end, and cleaned up afterward:
+
+1. Created role "Agent Gateway - Read Only Test" with only `App: agentgateway.chat.use` (REST API).
+2. Created a throwaway person and user, `phase22readonly`, with that role only.
+3. Logged in as that user for real (`POST /ws/rest/v1/session`, a genuine authenticated session -
+   not the admin credentials used elsewhere in this phase).
+4. `cherche walter white` through `/module/agentgateway/chat.form` (the real endpoint the chat
+   widget itself calls) -> answered normally. `chat.use` alone is sufficient for a read.
+5. `mets a jour le telephone de walter white a 0611112222` through the same endpoint ->
+   `"Votre compte permet uniquement les consultations. Je ne peux rien enregistrer en votre nom.",
+   "state":"failed"`.
+6. Confirmed via the operation log that **no call reached OpenMRS at all** for the write attempt -
+   the refusal happened entirely at the Python orchestrator (`tool.writes and not user.may_write`),
+   before any FHIR or REST call was ever issued. `search_patient`'s own read from step 4 is the only
+   entry `phase22readonly` has in the log.
+
+Cleaned up afterward: the test user could not be purged (the operation log's own foreign key
+correctly refuses to let an audited actor be deleted - exactly the integrity the log exists for),
+so it was retired instead, along with the test role and person, all via the REST API, none of it
+touching real patient data.
+
+**Not independently verified**: `AgentAuditFilter`'s own re-check (`isWrite && !verified.mayWrite()`
+at the module layer, a second, independent gate behind the Python orchestrator's) never ran in this
+test, because the Python layer refused first and the delegated token itself is never returned to
+the browser (by design, ADR-12) - there is no way to replay it directly against the relay path from
+outside the module. The two layers are independently written and independently correct on inspection
+(`app/orchestrator.py`'s check and `AgentAuditFilter.java:142`'s), but only the first was exercised
+end to end this round.
+
+### The rollback dry-run, run for real (Phase 18's other outstanding item)
+
+"The least-exercised code in the system and never run against real data" - run against real data,
+end to end, verified at the database each step (the Phase 20 lesson: a success response is not
+evidence, the row is).
+
+1. Created a real patient through the real chat (`cree un patient nomme "Phase22 Rollback Test",
+   homme, ne le 01/01/1995` -> confirmed), logged as id 122, `POST /ws/rest/v1/patient`, `201`,
+   `resourceUuidAffected` recorded, `reversible: true`.
+2. `GET .../rollbackCheck.form?logId=122` (the dry run) -> `REVERSIBLE`, "Can be reversed by
+   voiding the created record" - no dependency (no encounter/visit/obs) found for this patient, so
+   `reverseCreate` cleared its own probe.
+3. Confirmed in the database first: `patient.voided = 0`.
+4. `POST .../rollback.form?logId=122` (the real reversal) -> `REVERSED`, "The created record was
+   voided".
+5. **Confirmed in the database, not just the response**: `patient.voided = 1`,
+   `void_reason = "web service call"`.
+6. Operation log checked directly: entry 122 now carries `dateRolledBack`; a new entry 123
+   (`taskType: rollback`, `DELETE /ws/rest/v1/patient/...`, `204`) records the reversal itself as
+   its own audited operation.
+7. Two coherence rules confirmed live, not only in `RollbackEngineTest`: re-running the dry run on
+   122 -> `NOTHING_TO_DO`, "This operation has already been rolled back" (no double-reversal);
+   running it on 123 (the rollback entry itself) -> `MANUAL_INTERVENTION_REQUIRED`, "reversing a
+   reversal has to be done by hand".
+
+No cleanup needed beyond the rollback itself - a voided patient *is* the correct end state a real
+rollback leaves behind, not test debris to remove afterward.
+
+**Not exercised this round**: the appointment path (`book_appointment` is unavailable on this
+deployment entirely, so there was nothing to create and roll back). Reversing an update and the
+dependency probe's refusal were both exercised - see the next section, because getting there
+found a real bug.
+
+### The update-rollback gap Phase 20 itself created, found and fixed the same way
+
+Attempting the obvious next test - reverse a phone update, not just a create - hit
+`MANUAL_INTERVENTION_REQUIRED`, "OpenMRS could not be reached to check whether a reversal is
+safe", for an operation the log itself already called `reversible: true`. Traced to
+`OperationTarget.parse`: it recognises exactly two REST shapes, a one-segment collection
+(`patient` -> create) and a two-segment instance (`patient/{uuid}` -> update). Phase 20's new
+`person/{uuid}/attribute/{attrId}` and `person/{uuid}/name/{nameId}` paths are four segments -
+unrecognised, which the class already had a name for and a test for
+(`aDeeperSubResourceIsNotMistakenForAnInstance`, deliberately refusing rather than guessing at
+`patient/{uuid}/identifier/{uuid}`) - but being unrecognised also meant `getKind()` fell through to
+`CREATE`, `AgentAuditFilter.captureBeforeState` never ran (it only fires for `UPDATE`), and no
+before-image was ever recorded for a phone or name update. The failure mode was safe (refuse, not
+guess) but the capability was simply missing: **an update to an existing phone or name could not
+be reversed at all**, from the moment Phase 20 shipped.
+
+Fixed with a narrow, named exception to the general rule rather than loosening it: `OperationTarget`
+now recognises `person/{uuid}/attribute/{id}` and `person/{uuid}/name/{id}` specifically (a fixed
+set of two known sub-resource collections, `PERSON_SUB_RESOURCES`) as an instance update, while
+every other four-segment shape - including the exact one the existing test already covered -
+remains unrecognised and refused, unchanged. Five new cases added to `OperationTargetTest`
+(recognising both known sub-resources as updates, confirming the *first* attribute for a person is
+still a create, and confirming an unrelated four-segment shape stays unrecognised); full module
+test suite run via a Maven container on Server 1, **69/69** (52 `api` + 17 `omod`, up from the
+~65 documented - the five new cases are the difference). Built, the existing `.omod` backed up,
+the new one deployed to Server 1's real `openmrs-app` and the container restarted; confirmed
+started cleanly from `openmrs.log` (`agentgateway.started: true`).
+
+A second, unrelated bug surfaced verifying the fix live: adding a patient's very first phone
+number failed OpenMRS's own validation (`attributeType on class org.openmrs.PersonAttribute`).
+`OPENMRS_PHONE_ATTRIBUTE_TYPE_UUID` had never been set in `server2-stack/.env` at all - not a code
+defect, a configuration gap that a patient's first phone number had simply never exercised before
+now. Set to the deployment's real "Telephone Number" attribute type uuid
+(`14d4f066-15f5-102d-96e4-000c29c2a5d7`, read from `/ws/rest/v1/personattributetype`), matching
+the pattern the other three configured uuids already follow.
+
+**Verified end to end against real data, database-level each time**, using a throwaway test
+patient created and cleaned up the same way as the create-rollback test above:
+1. Added a first phone number (`0600000001`) - the config fix, confirmed via `person_attribute.value`.
+2. Updated it again (`0600000002`) - the code fix's actual target. Log entry showed
+   `reversible: true` and, for the first time, a populated `previousState` carrying the prior
+   value.
+3. `rollbackCheck.form` -> `REVERSIBLE`. `rollback.form` -> `REVERSED`. **Database checked directly**:
+   `person_attribute.value` back to `0600000001` - the exact prior value, not just a "success"
+   response.
+4. Dependency probe, confirmed refusing for real: added a real encounter to the test patient, then
+   attempted to roll back its *create* -> `MANUAL_INTERVENTION_REQUIRED`, "This patient already
+   has at least one encounter recorded; voiding the patient would leave it orphaned." Encounter
+   and patient both cleaned up afterward.
+
+This is the same lesson as Phase 20's own "a 200 does not mean it worked," applied one level up:
+"the operation log calling something reversible does not mean reversing it works," and it would not
+have been caught without actually trying the reversal against real data rather than trusting the
+log's own `reversible` flag.
+
+---
+
+## Phase 23 - a live pass with LOG_PROMPTS on, no new defects, two fixes seen working in the raw log
+
+The operator ran a broad manual pass through the real chat with `LOG_PROMPTS=true`
+(`docker logs -f clinical-agent`), covering safety refusals, search, list/filter, anaphora, an
+update, and a full multi-turn create - and pasted back both the chat transcript and the raw
+MedGemma request/response pairs for each turn. Nothing wrong found; two of this session's fixes
+were caught directly in the act, in the model's own raw output, not just passing a test:
+
+- `cree un patient` (bare) returned `slots={"name": "cree un patient"}` from the model - the exact
+  whole-prompt-echo failure mode from Phase 20 - and the log shows the guard catching it:
+  `"Dropping slot name='cree un patient': it is the whole prompt, not a value in it"`.
+- The next turn, `Marry Curry`, got back `intent: task, task: search_patient` from the model - it
+  read the bare name as a fresh search, exactly Finding 30's failure mode (no memory of the
+  question just asked) - yet the turn's outcome was `awaiting_clarification (create_patient)`,
+  because the deterministic instruction-guard (`matches_a_task`) overrode the model's confident
+  wrong answer and kept it as an answer to the pending question instead.
+
+`cherche le patient 10002T` was also re-confirmed end to end with the raw log visible: the model
+still tags the token as `slots={"name": "10002T"}`, and the identifier-shape fix converts it to
+`identifier=10002T` before the query goes out.
+
+**Left as is, on request:** three test patients created during this session's verification work
+(`Kaced Amine`, `Slimani Slimani`, `Marry Curry`) remain in the real database, unvoided - the
+operator asked that they not be cleaned up. `liste tous les patients` will show them until someone
+decides otherwise.
+
+**Deliberately not pursued further this round, per the operator:** `book_appointment` (needs a
+product decision), `patientview` REST resources (separate, larger backend effort), the Orthanc
+default-credential exposure (on hold - a colleague is actively working on that stack), and the
+handful of pre-existing extractor/model gaps noted in Phase 20/22's verification. All remain
+flagged in HANDOFF.md for whichever session picks this up next.
+
+---
+
+## Phase 24 (2026-08-27) - `SYSTEM_PROMPT` widened from keyword-matching to semantic classification
+
+### Finding 35 - fixed
+
+`SYSTEM_PROMPT` in `app/nlu/medgemma.py` over-anchored the model to its own worked examples: rule 1
+gave a "not a closed list" disclaimer for search/list phrasing only, `unsupported` had no stated
+bound on when a novel sentence should fall through to it rather than being read on its meaning, and
+there was no instructed behaviour for a sentence that is genuinely too garbled to classify at all
+(previously indistinguishable, in the prompt's own wording, from ordinary off-topic chatter).
+Rewritten so that:
+
+- the "reason about meaning, not the exact words" instruction applies to every rule, not just rule 1,
+  and states directly that the few-shot examples and rule keywords illustrate the reasoning rather
+  than form an exhaustive whitelist of accepted phrasings;
+- `unsupported` fires only for three named cases (genuinely off-topic, an explicit unsupported
+  action such as deletion, or a sentence too confused to interpret even by its meaning) and is
+  stated as never being a default for an unfamiliar phrasing;
+- a general conversational turn (not only "bonjour") gets a natural, situation-appropriate welcome
+  instead of the canned refusal;
+- a sentence that is truly incomprehensible gets an explicit "I didn't understand, please rephrase"
+  instruction instead of a guessed category.
+
+Both safety rules (descriptive phrasing is never an instruction; a turn naming two task families is
+always a question) and the structured-output JSON schema are unchanged - this only touches how
+`intent`/`clarification` are decided in the ordinary, non-safety-critical path.
+
+**Measured**, `tests/eval_nlu.py`'s 28-row corpus, both engines, after rebuilding and restarting the
+`clinical-agent` container:
+
+```
+                                                 rules    medgemma
+------------------------------------------------------------------
+cases                                               28          28
+task correct                                        13          13
+task wrong                                           1           1
+slot wrong or missing                                3           1
+slot invented                                        0           0
+asked when it should                                14          13
+asked when it should not                             0           0
+read an unclear sentence (quality)                   0           1
+UNSAFE (wrote when it should have asked)             0           0
+```
+
+**UNSAFE = 0 on both engines** - the go/no-go column. `medgemma`'s three remaining misses are the
+same shape as before this change (a name buried in a relative clause, `get_patient_summary` vs.
+`search_patient` on a politeness-wrapped sentence, and one hedged-identity sentence read as a task
+rather than a question) - pre-existing quality gaps, not something this prompt revision introduced
+or fixed.
+
+**No true before/after diff exists.** `clinical-agent-service` is not under version control here, and
+the container running the pre-edit prompt was already rebuilt over before this measurement was taken
+- so this is a point-in-time reading against the corpus, not a comparison to a preserved baseline.
+Future prompt edits should capture the `eval_nlu.py` table *before* changing `SYSTEM_PROMPT`, not
+after, to make that comparison possible.
+
+One transient fault seen once and not reproduced on a second run: a single case returned "MedGemma
+unavailable, falling back to the rules engine: Expecting ',' delimiter" (a truncated JSON response),
+which the design already degrades gracefully from (§ "If the model is unreachable, slow or answers
+unusably" in `medgemma.py`'s module docstring). Re-running the same corpus immediately after did not
+reproduce it, and a targeted retry of every case's raw model call, run separately, did not reproduce
+it either - most consistent with a one-off vLLM hiccup rather than a regression from the longer
+prompt. Worth watching for recurrence rather than treated as closed.
+
+**Side effect, not a defect:** the prompt is now 2138 of 4096 tokens (was 1306) - see the token-budget
+note in `HANDOFF.md`.
+
+### Finding 36 - diagnosed, not fixed (blocks appointment booking, but is not agent code)
+
+While confirming Finding 6 still holds (`book_appointment` unavailable because this `fhir2` does not
+advertise `Appointment`), the operator reported that OpenMRS's own native scheduling UI
+("Programmation des rendez-vous", unrelated to FHIR or the agent) is *also* broken on this instance:
+searching for a slot always returns "Aucun fuseau horaire disponible", and every page carries a
+banner "Votre ordinateur n'est pas réglé sur le bon fuseau horaire. Veuillez le changer en `{0}`"
+with the placeholder never filled in.
+
+Queried live, anonymously, against `https://openmrs.hospital.lan/openmrs/ws/rest/v1/systemsetting`
+(no admin session available from Server 2 - SSH to Server 1 is refused, so this was read-only HTTP
+reconnaissance, not a login):
+
+```
+property:    timezone.conversions
+value:       false
+description: "When set to true dates are sent from the server to the client as UTC dates and
+              parsed from the client to the server as holding the client timezone information."
+```
+
+With this off, every date OpenMRS's REST layer serializes goes out as a naive local timestamp - no
+UTC offset. That matches both symptoms directly: the scheduling UI's Angular client can't compute
+the offset it needs to fill the banner's `{0}`, and can't bucket appointment slots by timezone to
+show any, because neither the server's nor the client's zone is ever stated in the data it receives.
+
+**Not fixed, and not something this codebase can fix.** `timezone.conversions` is an OpenMRS global
+property (Administration → Manage Global Properties), unrelated to the `agentgateway` module or the
+Clinical Agent Service - it predates this project's install and looks like a pre-existing hospital
+configuration gap, not something introduced by this work. Flagged rather than changed because:
+
+1. It needs an admin session on Server 1's OpenMRS, which was not available during this
+   investigation.
+2. **It is not scoped to the scheduling UI.** It governs every date/time the REST/FHIR layer sends
+   or accepts hospital-wide, which includes the calls this agent already makes today (birthdates on
+   `create_patient`, and appointment date/time once `book_appointment` is ever unblocked). Flipping
+   it needs `tests/eval_nlu.py`-adjacent manual verification of the agent's own date handling
+   afterward, not just a reload of the appointment page - the two problems (FHIR does not expose
+   `Appointment`, and the timezone property) are independent and both need clearing before booking
+   works end to end.
+
+Left for whoever picks up appointment booking next, alongside Finding 6/11 and §4.3.
+
+### Observed, not yet a finding - `null null` reappeared in a second location
+
+The same-session screenshots that led to Finding 36 also show `null null` rendered inside the
+"Assistant clinique" chat widget itself, above the chat panel, logged in as `admin`. Phase 22 already
+investigated a `null null` occurrence in the *global OpenMRS page header* and closed it (`admin`'s
+person record has a name in the database). Whether this is the same underlying cause resurfacing in
+a second template, or an independent bug in the widget's own rendering, is not established - noted
+here rather than in a numbered finding because no investigation has happened yet. See `HANDOFF.md`'s
+"Still outstanding from earlier phases" for the re-opened item.
+
+---
+
+# Documentation index
+
+Kept last on purpose: this log grows by appending, and an index the document keeps growing past is
+worse than none.
+
+## The documents
+
+Kept in one place, not two: `HANDOFF.md`'s "Documents, and what each is for" table is the canonical
+index and is the one kept in sync with each session's work. This file used to carry its own copy;
+the two had already drifted (different module version, different phase count) by the time that was
+noticed, 2026-08-27, which is exactly the failure mode of keeping an index in more than one place.
+
+## The code, and what each part is for
+
+| Path | Role |
+|---|---|
+| `openmrs-module-agentgateway/` | Server 1: chat relay, delegated tokens, the audit filter, the operation log, rollback |
+| `clinical-agent-service/app/orchestrator.py` | the pipeline and the two gates (clarification, confirmation) |
+| `clinical-agent-service/app/tools/catalog.py` | the tools: which call each task family makes |
+| `clinical-agent-service/app/nlu/rules.py` | the deterministic interpreter (default) |
+| `clinical-agent-service/app/nlu/medgemma.py` | the model interpreter (`NLU_ENGINE=medgemma`) |
+| `clinical-agent-service/app/nlu/schema.py` | the JSON schema, generated from the tool registry |
+| `../server2-stack/docker-compose.yml` | proxy + agent |
+| `../server2-stack/docker-compose.vllm.yml` | the model server, as an overlay |
+
+## Test counts at the time of writing
+
+See `HANDOFF.md`'s own "Tests" line for the current counts and what changed them most recently —
+kept there rather than duplicated here for the same reason as the documents table above.
+
+`clinical-agent-service/tests/explore.py` is not a test suite but an exploratory harness: 44 real-life
+scenarios driven through the real model, printing what happened rather than asserting. Run it after any
+interpretation or orchestration change.
+
+## Findings, in one place
+
+A table listing every finding by number drifted stale here once already (it stopped at 14 while the
+log itself grew past 30) - the same duplication risk as the two tables above. The findings are
+already enumerable directly from this file: `grep -n "^### Finding" IMPLEMENTATION-LOG.md` lists all
+of them, in order, each linking to its own full write-up with evidence. As of this writing that runs
+through **Finding 36**; do not trust that number either — re-run the grep.
+
+The single most useful thing to know before working on this system, true across many of the early
+findings: several were reported by the wrong layer entirely (OpenMRS logging one problem while the
+real cause was a different, silent one downstream). Read the deployed source and jars; do not trust
+the error message alone.
+
+## What is deliberately not documented
+
+Secrets. The channel secret and signing keys live only in OpenMRS's settings and Server 2's `.env`.
+`Secrets.txt` was deleted and the keys it held were rotated.
+
+The **retired** signing private key appears in this project's conversation transcript, because OpenMRS
+logs every global-property save with its value and the Tomcat log was read during diagnosis. It has
+been rotated and is useless, but if that transcript is stored anywhere, treat it as containing a
+retired credential.

@@ -368,24 +368,26 @@ def test_the_success_message_names_the_created_patient(client, mint):
 
 
 def test_answering_with_an_identifier_escapes_an_ambiguous_name(client, mint, openmrs_server):
-    """Two patients matched a name; the identifier given in answer was discarded and the same
-    question came back forever. The answer now replaces the ambiguous name instead of losing to it.
+    """Two patients share the name given in the sentence; the identifier given in answer was
+    discarded and the same question came back forever. The answer now replaces the ambiguous name
+    instead of losing to it.
+
+    Both patients are named "Test Neurochir" on purpose: the extractor now resolves "<field> de
+    <name>" (Finding 31), so a sentence naming only one *distinct* Test Neurochir would resolve in
+    one turn and never reach the ambiguity this test is about.
     """
-    seed_patient(openmrs_server["app"], "Test", ["TEST"], "2003-02-05", identifier="10001V")
+    seed_patient(openmrs_server["app"], "Test", ["Neurochir"], "2003-02-05", identifier="10001V")
     seed_patient(openmrs_server["app"], "Test", ["Neurochir"], "1980-03-15", identifier="10007F")
 
     # The live sequence, turn for turn.
     first = say(client, mint, "mets a jour le telephone de Test Neurochir a 0555123456").json()
     assert first["state"] == "awaiting_clarification"
-    assert "De quel patient" in first["reply"]
+    assert "Plusieurs patients" in first["reply"]
 
-    second = say(client, mint, "Test").json()
-    assert "Plusieurs patients" in second["reply"]
-
-    third = say(client, mint, "10007F").json()
+    second = say(client, mint, "10007F").json()
     # The identifier must win over the ambiguous name. Anything but the same question again.
-    assert "Plusieurs patients" not in third["reply"]
-    assert third["state"] in ("awaiting_confirmation", "awaiting_clarification")
+    assert "Plusieurs patients" not in second["reply"]
+    assert second["state"] in ("awaiting_confirmation", "awaiting_clarification")
 
 
 def test_the_first_patient_question_accepts_an_identifier(client, mint, openmrs_server):
@@ -397,3 +399,57 @@ def test_the_first_patient_question_accepts_an_identifier(client, mint, openmrs_
 
     assert "Aucun patient" not in reply["reply"]
     assert "De quel patient" not in reply["reply"]
+
+
+# --- Findings 19, 20, 21 and the identifier-as-name defect --------------------------------
+
+
+def test_deletion_is_refused_by_name_not_by_incomprehension(client, mint):
+    """Finding 21. "Je n'ai pas compris" told the clinician a perfectly clear sentence was garbled."""
+    body = say(client, mint, "Supprime le patient avec ID 1000C6").json()
+
+    assert body["state"] == "unsupported"
+    assert "supprimer" in body["reply"].lower()
+    assert "pas compris" not in body["reply"].lower()
+
+
+def test_a_new_command_is_not_absorbed_into_a_pending_question(client, mint):
+    """Finding 19. "supprime tous les patients" was typed while a create was half-finished and came
+    back as the same "what is the patient's sex?" question - never seen as a request at all."""
+    first = say(client, mint, 'cree un patient nomme "Test Un"').json()
+    assert first["state"] == "awaiting_clarification"
+
+    second = say(client, mint, "supprime tous les patients").json()
+
+    assert second["reply"] != first["reply"], "the pending question was repeated verbatim"
+    assert "supprimer" in second["reply"].lower()
+
+
+def test_an_unrelated_reply_abandons_the_pending_request_out_loud(client, mint):
+    """Option (b): abandoning is announced. Silently swallowing a typed command is the worse failure."""
+    say(client, mint, 'cree un patient nomme "Test Deux"')
+    body = say(client, mint, "commande une pizza").json()
+
+    assert "abandonne" in body["reply"].lower()
+
+
+def test_an_unavailable_task_is_refused_before_any_question(client, mint):
+    """Finding 20. The interpreter's question was returned before availability was checked, so the
+    assistant asked for an appointment date and only then refused the booking it can never make."""
+    body = say(client, mint, "programme un rendez-vous pour Ahmed Ziani demain a 10h").json()
+
+    assert body["state"] == "unsupported"
+    assert "Appointment" in body["reply"] or "ne peux pas effectuer" in body["reply"]
+
+
+def test_an_identifier_is_searched_as_an_identifier_not_a_name(client, mint, mock_state, openmrs_server):
+    """The clinician wrote "du patient 1000C6"; the query went out as name=1000C6, which a FHIR name
+    search can never match, and the record was reported as non-existent."""
+    seed_patient(openmrs_server["app"], "Ghezal", ["Rachid"], "1999-06-15", identifier="1000C6")
+
+    say(client, mint, "mets a jour le telephone du patient 1000C6 a 0555123456")
+
+    searches = [c for c in mock_state["calls"] if c["method"] == "GET" and "Patient" in c["path"]]
+    assert searches, "no patient search was issued"
+    assert any("identifier=1000C6" in c["query"] for c in searches), \
+        f"searched by name instead of identifier: {[c['query'] for c in searches]}"

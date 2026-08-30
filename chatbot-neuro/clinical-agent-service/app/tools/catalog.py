@@ -20,10 +20,12 @@ from ..nlu.base import (
     TASK_BOOK_APPOINTMENT,
     TASK_CREATE_PATIENT,
     TASK_GET_PATIENT_SUMMARY,
+    TASK_LIST_PATIENTS,
     TASK_RECORD_NEURO_ASSESSMENT,
     TASK_SEARCH_PATIENT,
     TASK_UPDATE_PATIENT,
 )
+from ..nlu.rules import identifier_shaped
 from .registry import PlannedOperation, ToolRegistry, ToolSpec
 
 # Creating a patient in OpenMRS needs an identifier of a type the installation knows about.
@@ -127,8 +129,14 @@ def _readable_gender(value: str) -> str:
 
 
 def _build_search_patient(slots: Dict[str, Any], context: Dict[str, Any]) -> List[PlannedOperation]:
-    if slots.get("identifier"):
-        query = f"identifier={slots['identifier']}"
+    # A bare token shaped like an OpenMRS identifier (short, no spaces, digits present - "10002T")
+    # is searched as one, even when the extractor or the model put it in `name`: FHIR's `name`
+    # parameter cannot match an identifier, so "cherche le patient 10002T" searched name=10002T
+    # and reported the patient as unknown. `_resolve_patient` already applies this; this tool
+    # builds its own request independently and did not.
+    identifier = slots.get("identifier") or identifier_shaped(slots.get("name"))
+    if identifier:
+        query = f"identifier={identifier}"
     else:
         query = f"name={slots['name']}"
     return [
@@ -138,6 +146,13 @@ def _build_search_patient(slots: Dict[str, Any], context: Dict[str, Any]) -> Lis
             summary=f"Rechercher les patients correspondant a « {slots.get('identifier') or slots.get('name')} »",
         )
     ]
+
+
+def _build_list_patients(slots: Dict[str, Any], context: Dict[str, Any]) -> List[PlannedOperation]:
+    query = f"gender={_gender(slots['gender'])}" if slots.get("gender") else ""
+    path = "/ws/fhir2/R4/Patient?_count=50" + (f"&{query}" if query else "")
+    label = f" de sexe {_readable_gender(slots['gender'])}" if slots.get("gender") else ""
+    return [PlannedOperation(method="GET", path=path, summary=f"Lister les patients{label}")]
 
 
 def _build_patient_summary(slots: Dict[str, Any], context: Dict[str, Any]) -> List[PlannedOperation]:
@@ -263,30 +278,71 @@ def _summarise_create_patient(slots: Dict[str, Any], context: Dict[str, Any]) ->
 
 
 def _build_update_patient(slots: Dict[str, Any], context: Dict[str, Any]) -> List[PlannedOperation]:
-    """A targeted PATCH-shaped update expressed as a full FHIR PUT.
+    """Targeted updates through `webservices.rest`, not FHIR - and this one took two attempts to get
+    right, both wrong in the same way CREATE_VIA_REST already was: assuming FHIR PUT works for a
+    sub-resource that already exists just because a plain create is what is documented as broken.
 
-    The body is built from the patient's *current* resource with only the requested fields
-    replaced (the orchestrator puts it in ``context['current_patient']``). Sending a freshly
-    invented Patient resource instead would silently blank every field the clinician did not
-    mention, which is the single most damaging thing this tool could do.
+    Verified directly against the real deployment, not inferred: a FHIR PUT that replaces an
+    existing telecom or name entry with a fresh dict - even one carrying that entry's own `id` -
+    returns 200 and changes **nothing** in the database. Decompiling `PersonTranslatorImpl` (fhir2
+    1.2.2) explains why: every incoming ContactPoint/HumanName is mapped to a *brand-new*
+    `PersonAttribute`/`PersonName` object (`lambda$toOpenmrsType$0` calls `new PersonAttribute()`
+    before translating into it), never the managed entity fhir2 itself just read. Hibernate holds
+    that sub-collection as a `Set`; a new object carrying the same `uuid` reads as "already
+    present" by whatever equality that `Set` uses and the value change is silently dropped - a
+    quieter cousin of Finding 10's "Column 'uuid' cannot be null" (which is exactly what happens
+    instead when the id is left off a brand-new entry). Either way, FHIR cannot change a value that
+    is already there. `webservices.rest`'s own attribute/name sub-resources can, confirmed by
+    reading the value back afterwards: `POST .../person/{uuid}/attribute/{attrUuid}` and
+    `POST .../person/{uuid}/name/{nameUuid}` both persisted where the FHIR PUT silently had not.
+
+    The patient's *current* resource (``context['current_patient']``, read via FHIR - reads are
+    unaffected) supplies the existing attribute's or name's id, so an edit targets that specific
+    row instead of guessing. No id means no such entry exists yet, and a POST to the parent
+    collection creates one.
     """
-    current = dict(context["current_patient"])
+    person_uuid = context["patient_uuid"]
+    current = context["current_patient"]
+    operations: List[PlannedOperation] = []
+
     if slots.get("phone"):
-        telecom = [entry for entry in current.get("telecom", []) if entry.get("system") != "phone"]
-        telecom.append({"system": "phone", "value": slots["phone"]})
-        current["telecom"] = telecom
+        existing = (current.get("telecom") or [{}])[0]
+        attribute_id = existing.get("id")
+        if attribute_id:
+            operations.append(
+                PlannedOperation(
+                    method="POST",
+                    path=f"/ws/rest/v1/person/{person_uuid}/attribute/{attribute_id}",
+                    body={"value": slots["phone"]},
+                    summary="Mettre a jour le numero de telephone",
+                )
+            )
+        else:
+            operations.append(
+                PlannedOperation(
+                    method="POST",
+                    path=f"/ws/rest/v1/person/{person_uuid}/attribute",
+                    body={"attributeType": PHONE_ATTRIBUTE_TYPE_UUID, "value": slots["phone"]},
+                    summary="Ajouter un numero de telephone",
+                )
+            )
+
     if slots.get("name"):
         name = _split_name(slots["name"])
-        current["name"] = [{"use": "official", "family": name["family"], "given": name["given"]}]
-
-    return [
-        PlannedOperation(
-            method="PUT",
-            path=f"/ws/fhir2/R4/Patient/{context['patient_uuid']}",
-            body=current,
-            summary="Mettre a jour la fiche administrative du patient",
+        given = " ".join(name["given"]) if name["given"] else name["family"]
+        body = {"givenName": given, "familyName": name["family"]}
+        existing_names = current.get("name") or []
+        name_id = existing_names[0].get("id") if existing_names else None
+        path = (
+            f"/ws/rest/v1/person/{person_uuid}/name/{name_id}"
+            if name_id
+            else f"/ws/rest/v1/person/{person_uuid}/name"
         )
-    ]
+        operations.append(
+            PlannedOperation(method="POST", path=path, body=body, summary="Mettre a jour le nom")
+        )
+
+    return operations
 
 
 def _summarise_update_patient(slots: Dict[str, Any], context: Dict[str, Any]) -> str:
@@ -388,6 +444,17 @@ TOOLS = [
         summarise=lambda slots, context: "",
     ),
     ToolSpec(
+        name="list_patients",
+        task=TASK_LIST_PATIENTS,
+        writes=False,
+        description="Lister ou filtrer les patients, par exemple par sexe",
+        fhir_resource="Patient",
+        fhir_interaction="search-type",
+        expected_privilege="Get Patients",
+        build=_build_list_patients,
+        summarise=lambda slots, context: "",
+    ),
+    ToolSpec(
         name="get_patient_summary",
         task=TASK_GET_PATIENT_SUMMARY,
         writes=False,
@@ -430,8 +497,12 @@ TOOLS = [
         writes=True,
         description="Mettre a jour les informations administratives d'un patient",
         requires_patient=True,
-        fhir_resource="Patient",
-        fhir_interaction="update",
+        # No fhir_resource: targets webservices.rest, not FHIR (see the note on _build_update_patient
+        # - a FHIR PUT cannot actually change an existing telecom or name value on this deployment).
+        # Availability therefore is not read from the FHIR capability statement, matching
+        # create_patient's own reasoning: webservices.rest is a hard dependency of the module and
+        # always present where the assistant runs at all. Reading the patient to resolve who this is
+        # about (`requires_patient`) still goes through FHIR - only the write moved.
         expected_privilege="Edit Patients",
         build=_build_update_patient,
         summarise=_summarise_update_patient,

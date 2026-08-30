@@ -26,10 +26,23 @@ from .conversation import PendingAction, PendingOperation, store
 from .nlu.base import (
     INTENT_CANCEL,
     INTENT_CONFIRM,
+    INTENT_TASK,
     INTENT_UNSUPPORTED,
+    TASK_LIST_PATIENTS,
+    TASK_SEARCH_PATIENT,
+    TASK_UPDATE_PATIENT,
     Interpretation,
 )
-from .nlu.rules import RuleBasedNlu, classify_answer, extract_slots
+from .nlu.rules import (
+    BARE_IDENTIFIER_RE as _BARE_IDENTIFIER_RE,
+    DELETION_REFUSAL,
+    RuleBasedNlu,
+    classify_answer,
+    extract_slots,
+    identifier_shaped as _identifier_shaped,
+    matches_a_task,
+    reads_as_deletion,
+)
 from .openmrs_client import ApiResult, OpenmrsClient, OpenmrsUnavailable, explain_failure
 from .security import ActingUser
 from .tools.registry import PlannedOperation, ToolRegistry, ToolSpec, missing_slots
@@ -68,8 +81,8 @@ class Orchestrator:
         from .config import settings
         from .tools.catalog import build_registry
 
-        self._nlu = nlu or RuleBasedNlu()
         self._tools = tool_registry or build_registry(settings.patientview_tools_enabled)
+        self._nlu = nlu if nlu is not None else _build_nlu(self._tools)
 
     # ------------------------------------------------------------------ entry point
 
@@ -88,21 +101,56 @@ class Orchestrator:
         if state.pending is not None:
             return await self._handle_pending_answer(prompt, delegated_token, user, state)
 
-        interpretation = self._interpret_with_carryover(prompt, state)
+        # Deletion is refused by name, and refused *first*. Two reasons it cannot wait: the generic
+        # fallback told the clinician their perfectly clear sentence was not understood, and an
+        # unrecognised turn is indistinguishable from an answer to a pending question - so
+        # "supprime tous les patients", typed while a create was half-finished, was absorbed into it
+        # and never answered at all.
+        if reads_as_deletion(prompt):
+            state.draft_task = None
+            state.draft_slots = {}
+            state.awaiting_slot = None
+            return TurnResult(reply=DELETION_REFUSAL, state=STATE_UNSUPPORTED)
+
+        interpretation = await self._interpret_with_carryover(prompt, state)
 
         if interpretation.intent == INTENT_UNSUPPORTED or interpretation.task is None:
             state.draft_task = None
             state.draft_slots = {}
             return TurnResult(
-                reply=interpretation.clarification or "Je ne peux pas traiter cette demande.",
+                # The interpreter is expected to always produce a contextual reply for this case
+                # (a welcome for small talk, a reasoned refusal otherwise) - this generic text is
+                # only the last-resort safety net for the rare turn where it produced none at all.
+                reply=interpretation.clarification or (
+                    "Je peux rechercher un patient, afficher son dossier, en creer ou mettre a "
+                    "jour un, noter un score neurologique, ou programmer un rendez-vous. Que "
+                    "souhaitez-vous faire ?"
+                ),
                 state=STATE_UNSUPPORTED,
             )
 
+        # Availability is settled before any question is asked. Asking a clinician for an appointment
+        # date, and then refusing the booking a turn later because this installation has no
+        # Appointment resource at all, wastes their time and reads as the assistant changing its mind.
+        # The refusal used to fire correctly for exactly this case; it stopped once the interpreter
+        # started producing a clarification for that phrasing, because the clarification was returned
+        # first.
+        unavailable = self._unavailable_reason(interpretation.task)
+        if unavailable is not None:
+            state.draft_task = None
+            state.draft_slots = {}
+            state.awaiting_slot = None
+            return TurnResult(reply=unavailable, state=STATE_UNSUPPORTED, task_type=interpretation.task)
+
         if interpretation.needs_clarification:
             # Hold on to what was understood so the answer to the question completes the request
-            # instead of restarting it.
+            # instead of restarting it. Which slot the answer belongs in is recorded too, when it
+            # can be worked out from the tool's own required slots - this clarification is asked
+            # before the request is ever handed to the tool layer, so this is the only place that
+            # knows both the task and what it is still missing (Finding 29).
             state.draft_task = interpretation.task
             state.draft_slots = dict(interpretation.slots)
+            state.awaiting_slot = self._primary_missing_slot(interpretation.task, interpretation.slots)
             return TurnResult(
                 reply=interpretation.clarification,
                 state=STATE_AWAITING_CLARIFICATION,
@@ -157,20 +205,90 @@ class Orchestrator:
             pending.task_type,
             prompt,
             success_prefix="C'est enregistre.",
+            state=state,
         )
 
     # ------------------------------------------------------------------ planning
 
-    def _interpret_with_carryover(self, prompt: str, state) -> Interpretation:
-        interpretation = self._nlu.interpret(prompt, {})
+    def _unavailable_reason(self, task: Optional[str]) -> Optional[str]:
+        """The reason this deployment cannot do the task, or None if it can.
+
+        Read from the live capability statement, never from a list written down here (ADR-10).
+        """
+        if task is None:
+            return None
+        availability = self._tools.for_task(task, capability_registry.current)
+        if availability is None:
+            return "Cette action ne fait pas partie de ce que je sais faire."
+        if not availability.available:
+            return f"Je ne peux pas effectuer cette action ici. {availability.reason}"
+        return None
+
+    def _primary_missing_slot(self, task: Optional[str], slots: Dict[str, Any]) -> Optional[str]:
+        """The one slot a reply to this clarification most likely fills, or None if that is unknowable.
+
+        Reuses the tool's own ``required_slots`` - the same list the gap-check further down the
+        pipeline asks against - rather than a second, hand-maintained notion of what a task needs.
+        None when the task itself is what is ambiguous (two task families matched) or every
+        required slot is already filled and something else prompted the question: there is no
+        single slot to aim a bare reply at, so none is recorded rather than guessed.
+        """
+        if task is None:
+            return None
+        availability = self._tools.for_task(task, capability_registry.current)
+        if availability is None:
+            return None
+        gaps = missing_slots(availability.tool, slots)
+        return gaps[0] if gaps else None
+
+    async def _interpret_with_carryover(self, prompt: str, state) -> Interpretation:
+        # An engine that talks to a model exposes ``ainterpret``; calling its sync ``interpret``
+        # would block the event loop for the length of a GPU call. The rules engine has only the
+        # sync form, and needs no thread for a handful of regexes.
+        if hasattr(self._nlu, "ainterpret"):
+            interpretation = await self._nlu.ainterpret(prompt, {})
+        else:
+            interpretation = self._nlu.interpret(prompt, {})
 
         draft_task = getattr(state, "draft_task", None)
         awaiting = getattr(state, "awaiting_slot", None)
+
+        if draft_task and interpretation.intent != INTENT_UNSUPPORTED and not matches_a_task(prompt):
+            # A question is pending, and this reply carries none of the vocabulary a fresh
+            # instruction would - a bare name, a bare date, "masculin" on its own. The model is
+            # asked with no memory of the question ("Nadia Belkacem" alone has nothing in it to
+            # read as a task), so left to itself it confidently classifies the reply as a brand
+            # new request - which silently abandoned a half-finished create in favour of a search
+            # for the name just given (Finding 30). The deterministic vocabulary check is trusted
+            # over the model's guess here, precisely because a pending question means the turn is
+            # already known not to be a fresh instruction unless it plainly reads like one.
+            interpretation = Interpretation(intent=INTENT_UNSUPPORTED, slots=interpretation.slots)
 
         if draft_task and interpretation.intent == INTENT_UNSUPPORTED:
             # The turn does not name a task because it is the answer to a question we asked.
             merged = dict(getattr(state, "draft_slots", {}))
             merged.update(extract_slots(prompt))
+
+            if awaiting == "update_field":
+                # Finding 28: the reply to "que faut-il modifier ?" must never be guessed into a
+                # slot - that guess is exactly what wrote a clarifying answer into an existing
+                # patient's name. Only proceed when the reply itself supplied a value the
+                # extractor actually found (e.g. "le telephone est 0555123456"); otherwise ask to
+                # be told the field and the value together rather than pick one.
+                if merged.get("phone") or merged.get("name"):
+                    state.awaiting_slot = None
+                    return Interpretation(intent=INTENT_TASK, task=draft_task, slots=merged)
+                log.info("Abandoning %s: %r names neither a field nor a value to update", draft_task, prompt)
+                state.draft_task = None
+                state.draft_slots = {}
+                state.awaiting_slot = None
+                return Interpretation(
+                    intent=INTENT_UNSUPPORTED,
+                    clarification=(
+                        "Je n'ai pas compris quel champ modifier. Precisez le champ et la nouvelle "
+                        "valeur ensemble, par exemple : « le telephone est 0555123456 »."
+                    ),
+                )
 
             if awaiting:
                 # The answer belongs in the slot that was asked about, and it must be allowed to
@@ -178,13 +296,44 @@ class Orchestrator:
                 # inescapable: asked to narrow a name down to an identifier, the stale name kept
                 # winning and the same question came back forever.
                 slot, answer = _bare_slot_answer(awaiting, prompt, merged)
-                if answer is not None:
-                    merged[slot] = answer
-                    if slot == "identifier":
-                        # Searching by identifier is exact. Leaving the ambiguous name in place
-                        # would just reproduce the ambiguity that prompted the question.
-                        merged.pop("name", None)
+                if answer is None:
+                    # A reply that answers nothing is not an answer. Re-asking made the assistant
+                    # repeat one question indefinitely while absorbing whatever the clinician typed -
+                    # including "supprime tous les patients", which was never seen as a request at
+                    # all. Abandoning the half-finished request out loud costs one turn and keeps
+                    # every typed command visible.
+                    log.info("Abandoning %s: %r does not answer the pending question", draft_task, prompt)
+                    state.draft_task = None
+                    state.draft_slots = {}
+                    state.awaiting_slot = None
+                    return Interpretation(
+                        intent=INTENT_UNSUPPORTED,
+                        clarification=(
+                            "J'abandonne la demande precedente, votre message ne repondait pas a ma "
+                            "question. " + (interpretation.clarification or
+                                            "Reformulez ce que vous souhaitez faire.")
+                        ),
+                    )
+                merged[slot] = answer
+                if slot == "identifier":
+                    # Searching by identifier is exact. Leaving the ambiguous name in place would
+                    # just reproduce the ambiguity that prompted the question.
+                    merged.pop("name", None)
                 state.awaiting_slot = None
+            elif draft_task == TASK_UPDATE_PATIENT:
+                # Same reasoning as the update_field branch above, for any other update question
+                # that was asked without recording what it was about: defaulting an unrecognised
+                # reply into the name field is never safe for a task that overwrites an existing
+                # record, so this refuses to guess rather than fall through to the generic default
+                # below (Finding 28/29).
+                log.info("Abandoning %s: no slot was recorded for the pending question", draft_task)
+                state.draft_task = None
+                state.draft_slots = {}
+                state.awaiting_slot = None
+                return Interpretation(
+                    intent=INTENT_UNSUPPORTED,
+                    clarification="Je n'ai pas compris. Precisez ce qu'il faut modifier et la nouvelle valeur.",
+                )
             else:
                 merged.setdefault("name", prompt.strip())
 
@@ -237,6 +386,22 @@ class Orchestrator:
             tool_context.update(resolution["context"])
             state.last_patient_uuid = tool_context["patient_uuid"]
 
+            if (
+                tool.task == TASK_UPDATE_PATIENT
+                and slots.get("name")
+                and not slots.get("identifier")
+                and not _identifier_shaped(slots.get("name"))
+            ):
+                # The name found *which* patient this is about; update_patient_demographics reads
+                # that very same slot as "the new name to write" downstream, and nothing before
+                # this point distinguishes the two. That collision is the structural cause of
+                # Finding 28: a reply that only said who to update ("nom", or a name search that
+                # had to fall back to disambiguation) was, once, indistinguishable from an
+                # instruction to rename them. It has now done its job of finding the patient, so
+                # it is dropped before it can also be read as a value to write - the write must
+                # only ever touch what was actually asked to change.
+                slots.pop("name", None)
+
         gaps = missing_slots(tool, slots)
         if gaps:
             state.draft_task = tool.task
@@ -257,6 +422,12 @@ class Orchestrator:
             if not any(slots.get(field) for field in ("phone", "name")):
                 state.draft_task = tool.task
                 state.draft_slots = slots
+                # Finding 28: this question was the one place a clarifying answer landed straight
+                # in the patient's name field, because nothing recorded that it had even been
+                # asked - the reply to "que faut-il modifier ?" fell through to the generic "if we
+                # do not know what we asked, treat it as a name" default. Naming the slot here
+                # routes the answer through the dedicated, corroborated handling below instead.
+                state.awaiting_slot = "update_field"
                 return TurnResult(
                     reply="Que faut-il modifier exactement (par exemple le telephone ou le nom) ?",
                     state=STATE_AWAITING_CLARIFICATION,
@@ -268,7 +439,9 @@ class Orchestrator:
         operations = tool.build(slots, tool_context)
 
         if not tool.writes:
-            return await self._execute(operations, delegated_token, state.conversation_id, tool.task, prompt)
+            return await self._execute(
+                operations, delegated_token, state.conversation_id, tool.task, prompt, state=state
+            )
 
         summary = tool.summarise(slots, tool_context)
         if tool.task == "create_patient":
@@ -313,16 +486,18 @@ class Orchestrator:
                 "awaiting_slot": "patient",
             }
 
-        query = (
-            f"identifier={slots['identifier']}" if slots.get("identifier") else f"name={slots['name']}"
-        )
+        # A token that looks like a record number is searched as an identifier, not as a name. The
+        # clinician typing "le patient 1000C6" means the identifier, and FHIR's `name` parameter can
+        # never match one - it returned nothing and the assistant reported the patient as unknown.
+        identifier = slots.get("identifier") or _identifier_shaped(slots.get("name"))
+        query = f"identifier={identifier}" if identifier else f"name={slots['name']}"
         try:
             result = await client.call("GET", f"/ws/fhir2/R4/Patient?{query}&_count=10")
         except OpenmrsUnavailable:
             return {"error": "OpenMRS n'a pas repondu. Reessayez dans un instant."}
 
         if not result.ok:
-            return {"error": explain_failure(result.status, result.body)}
+            return {"error": explain_failure(result.status, result.body, searching=True)}
 
         matches = _bundle_entries(result.body)
         if not matches:
@@ -377,6 +552,7 @@ class Orchestrator:
         task_type: str,
         prompt: str,
         success_prefix: str = "",
+        state: Optional[Any] = None,
     ) -> TurnResult:
         client = OpenmrsClient(delegated_token, conversation_id, task_type, prompt)
         results: List[ApiResult] = []
@@ -413,13 +589,24 @@ class Orchestrator:
             if not result.ok:
                 # Stop at the first failure rather than pressing on: a later call in the same
                 # plan usually depends on the one that just failed.
+                searching = operation.method.upper() == "GET" and "?" in operation.path
                 return TurnResult(
-                    reply="Echec : " + explain_failure(result.status, result.body),
+                    reply="Echec : " + explain_failure(result.status, result.body, searching=searching),
                     state=STATE_FAILED,
                     task_type=task_type,
                     executed=executed,
                 )
             results.append(result)
+
+        if state is not None and task_type == TASK_SEARCH_PATIENT and results:
+            # A search that lands on exactly one patient is the natural antecedent for "son
+            # dossier" or "son telephone" in the very next turn. Without this, search_patient's
+            # requires_patient=False meant last_patient_uuid was never set by a search at all, so
+            # the clinician's most natural follow-up always asked "de quel patient s'agit-il ?"
+            # (Finding 32).
+            matches = _bundle_entries(results[0].body)
+            if len(matches) == 1:
+                state.last_patient_uuid = matches[0].get("id")
 
         reply = _render_results(task_type, results)
         if success_prefix:
@@ -466,7 +653,27 @@ def _patient_label(patient: Dict[str, Any]) -> str:
     return " - ".join(parts)
 
 
-_BARE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-]{2,19}$")
+
+
+def _build_nlu(registry: ToolRegistry):
+    """The interpreter this deployment is configured for.
+
+    Defaults to the deterministic engine. A deployment that has not stood up a GPU keeps working
+    rather than failing every turn, and switching is one environment variable - which also makes
+    "is it the model?" answerable in one restart when a turn is read wrongly.
+    """
+    from .config import settings
+
+    if settings.nlu_engine == "medgemma":
+        from .nlu.medgemma import MedGemmaNlu
+
+        log.info("Interpretation: MedGemma at %s (falling back to rules on failure)", settings.llm_base_url)
+        return MedGemmaNlu(registry, fallback=RuleBasedNlu())
+
+    if settings.nlu_engine not in ("rules", ""):
+        log.warning("Unknown NLU_ENGINE %r; using the rules engine", settings.nlu_engine)
+    log.info("Interpretation: deterministic rules engine")
+    return RuleBasedNlu()
 
 
 def _bare_slot_answer(asked: str, prompt: str, already: Dict[str, Any]) -> Tuple[str, Optional[Any]]:
@@ -497,6 +704,12 @@ def _bare_slot_answer(asked: str, prompt: str, already: Dict[str, Any]) -> Tuple
         return asked, answer.upper() if _BARE_IDENTIFIER_RE.match(answer) else None
     if asked == "name":
         return asked, answer
+    if asked == "birthdate" and already.get("dates"):
+        # The extractor only fills `birthdate` when the sentence carries a birth cue ("ne le") -
+        # right for an ordinary sentence, wrong here, because the question just asked *is* that
+        # cue. A bare date in reply to "quelle est la date de naissance ?" needs no cue of its
+        # own; the question already supplied it (Finding 30).
+        return asked, already["dates"][0]
     # Any other slot (a date, a gender, a phone number) has its own extractor, and guessing from
     # free text would be worse than asking the question again.
     return asked, None
@@ -511,6 +724,14 @@ def _render_results(task_type: str, results: List[ApiResult]) -> str:
         if not matches:
             return "Aucun patient ne correspond a cette recherche."
         listing = "\n".join(f"  - {_patient_label(entry)}" for entry in matches[:10])
+        plural = "s" if len(matches) > 1 else ""
+        return f"{len(matches)} patient{plural} trouve{plural} :\n{listing}"
+
+    if task_type == TASK_LIST_PATIENTS:
+        matches = _bundle_entries(results[0].body)
+        if not matches:
+            return "Aucun patient ne correspond a ce filtre."
+        listing = "\n".join(f"  - {_patient_label(entry)}" for entry in matches[:20])
         plural = "s" if len(matches) > 1 else ""
         return f"{len(matches)} patient{plural} trouve{plural} :\n{listing}"
 

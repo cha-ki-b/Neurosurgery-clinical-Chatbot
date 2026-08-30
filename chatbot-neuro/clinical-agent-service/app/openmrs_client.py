@@ -73,12 +73,18 @@ class OpenmrsUnavailable(Exception):
     """OpenMRS could not be reached at all. Distinct from OpenMRS refusing something."""
 
 
-def explain_failure(status: int, body: Any) -> str:
+def explain_failure(status: int, body: Any, *, searching: bool = False) -> str:
     """Turns a status code into the specific, non-technical reason CA8 asks for.
 
-    Deliberately not a generic "an error occurred": the four reasons below are the ones a
-    clinician can actually act on - ask an administrator, check the name, try again, or correct
-    what they typed.
+    Deliberately not a generic "an error occurred": the reasons below are the ones a clinician can
+    actually act on - ask an administrator, check the name, try again, or correct what they typed.
+
+    ``searching`` marks a call whose "nothing matched" answer is a **200 with an empty result**, which
+    is every FHIR search. For those a 404 cannot mean "no such patient" - it means the request never
+    reached the API - and saying "introuvable" turns an infrastructure fault into a clinical fact.
+    That mistranslation cost this project a week: for roughly 45 minutes the audit filter on Server 1
+    was not intercepting, every relayed call fell through to a 404, and the assistant told clinicians
+    their patients did not exist. The searches were correct; the endpoint was missing.
     """
     if status in (401, 403):
         return (
@@ -86,6 +92,12 @@ def explain_failure(status: int, body: Any) -> str:
             "Contactez un administrateur si vous pensez que c'est une erreur."
         )
     if status == 404:
+        if searching:
+            return (
+                "Je n'ai pas pu interroger le dossier patient : OpenMRS n'a pas repondu a cette "
+                "requete (404). Ce n'est pas un patient introuvable, c'est un probleme technique - "
+                "signalez-le a un administrateur."
+            )
         return "Le dossier demande est introuvable dans OpenMRS."
     if status == 409:
         return "OpenMRS a refuse l'operation car elle entre en conflit avec une donnee existante."
