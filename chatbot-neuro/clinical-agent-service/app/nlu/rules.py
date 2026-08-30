@@ -28,6 +28,7 @@ from .base import (
     TASK_BOOK_APPOINTMENT,
     TASK_CREATE_PATIENT,
     TASK_GET_PATIENT_SUMMARY,
+    TASK_LIST_PATIENTS,
     TASK_RECORD_NEURO_ASSESSMENT,
     TASK_SEARCH_PATIENT,
     TASK_UPDATE_PATIENT,
@@ -128,7 +129,35 @@ _TASK_PATTERNS: List[Tuple[str, re.Pattern]] = [
         TASK_SEARCH_PATIENT,
         re.compile(r"\b(cherche[rz]?|recherche[rz]?|trouve[rz]?|retrouve[rz]?|search|find|lookup|qui est)\b"),
     ),
+    (
+        TASK_LIST_PATIENTS,
+        # "liste"/"donne moi" plus "tous les patients"/"toutes les patientes" - a request for several
+        # records at once, not one named patient. Kept separate from search_patient because that tool
+        # requires a name and would ask for one nobody meant to give (capability gap, not a bug).
+        re.compile(
+            r"\b(liste[rz]?|list)\b.{0,20}\bpatient"
+            r"|\b(tous les patients|toutes les patientes|all patients)\b"
+            r"|\bdonne[rz]?[\s-]moi\b.{0,20}\bpatient"
+        ),
+    ),
 ]
+
+# Deletion is recognised on purpose, so it can be refused *by name*. Falling through to the generic
+# "je n'ai pas compris" told the clinician the sentence was unintelligible when in fact it was
+# perfectly clear and simply not offered - and, worse, an unrecognised turn is indistinguishable from
+# an answer to a pending question, so "supprime tous les patients" was absorbed into a half-finished
+# create instead of being answered at all.
+_DELETE_RE = re.compile(r"\b(supprime[rz]?|efface[rz]?|retire[rz]?|enleve[rz]?|delete|remove)\b")
+
+DELETION_REFUSAL = (
+    "Je ne peux pas supprimer de dossier : l'assistant n'a aucune capacite de suppression. "
+    "Un dossier se retire uniquement dans OpenMRS, par une personne habilitee."
+)
+
+
+def reads_as_deletion(prompt: str) -> bool:
+    return bool(_DELETE_RE.search(normalise(prompt)))
+
 
 WRITE_TASKS = {
     TASK_CREATE_PATIENT,
@@ -139,13 +168,31 @@ WRITE_TASKS = {
 
 
 def _match_tasks(text: str) -> List[str]:
-    return [task for task, pattern in _TASK_PATTERNS if pattern.search(text)]
+    matched = [task for task, pattern in _TASK_PATTERNS if pattern.search(text)]
+    if TASK_LIST_PATIENTS in matched and _DELETE_RE.search(text):
+        # "supprime tous les patients" carries the list vocabulary too ("tous les patients") but is
+        # a deletion request, not a listing one. Deletion is refused outright (reads_as_deletion is
+        # checked before interpretation ever runs) and must never be read as an ordinary task.
+        matched = [task for task in matched if task != TASK_LIST_PATIENTS]
+    return matched
+
+
+def matches_a_task(prompt: str) -> bool:
+    """Whether this sentence carries the vocabulary of a fresh instruction, any task family.
+
+    Used by the orchestrator to tell a genuinely new request apart from a bare reply to a
+    question it just asked ("Nadia Belkacem", "masculin", a bare date) - the model has no memory
+    of the question between turns, and taking its confident-but-uninformed guess at face value
+    was silently abandoning a half-finished request (Finding 30).
+    """
+    return bool(_match_tasks(normalise(prompt)))
 
 
 # --------------------------------------------------------------------------- slot extraction
 
 _NAME_AFTER_KEYWORD_RE = re.compile(
-    r"(?:nomm[ée]{1,2}|appel[ée]{1,2}|patient(?:e)?|dossier de|dossier d'|de la patiente|du patient|pour)\s+"
+    r"(?:nomm[ée]{1,2}|appel[ée]{1,2}|patient(?:e)?|dossier de|dossier d'|de la patiente|du patient|pour"
+    r"|telephone de|tel de|numero de|adresse de|nom de|naissance de)[,\s]+"
     r"((?:[A-ZÀ-Ý][\w'’\-]+)(?:\s+[A-ZÀ-Ý][\w'’\-]+)*)"
 )
 _QUOTED_RE = re.compile(r"[\"«“]([^\"»”]{2,60})[\"»”]")
@@ -156,7 +203,13 @@ _QUOTED_RE = re.compile(r"[\"«“]([^\"»”]{2,60})[\"»”]")
 # whether a name was given, so a lowercase run of words is accepted too, guarded by the stopword
 # list below so that "le patient avec un GCS bas" does not yield a patient called "avec un".
 _NAME_AFTER_KEYWORD_LOOSE_RE = re.compile(
-    r"(?:nomm[ée]{1,2}|appel[ée]{1,2}|patient(?:e)?|dossier de|dossier d'|de la patiente|du patient|pour)\s+"
+    # Comma tolerance is deliberately *not* added here, unlike the capitalised regex above: a
+    # comma after "patient" is at least as often a clause break as a name introduction - "le
+    # telephone du patient, tel 0555 12 34 56" would otherwise capture "tel 0555 12" as a name.
+    # The capitalised form carries its own evidence (a capital letter) that what follows really is
+    # a name; a lower-case run of words after a comma does not, and is left unmatched instead.
+    r"(?:nomm[ée]{1,2}|appel[ée]{1,2}|patient(?:e)?|dossier de|dossier d'|de la patiente|du patient|pour"
+    r"|telephone de|tel de|numero de|adresse de|nom de|naissance de)\s+"
     r"((?:[\w'’\-]+)(?:\s+[\w'’\-]+){0,2})",
     re.IGNORECASE,
 )
@@ -169,6 +222,16 @@ _NAME_STOPWORDS = {
     "gcs", "glasgow", "karnofsky", "dossier", "patient", "patiente", "rendez", "vous",
     "identifiant", "matricule", "id", "numero", "nom", "prenom", "ans", "an",
     "aujourd", "hui", "demain", "hier", "svp", "merci",
+    # The trigger words themselves. `re.search` takes the *leftmost* trigger, so in "Cree nouveau
+    # patient nomme rachid ghezal" it matches "patient" and then captures the next three words -
+    # "nomme rachid ghezal". A patient was created in the live database called "nomme rachid ghezal".
+    # A trigger word can never be part of the name that follows it.
+    "nomme", "nommee", "appele", "appelee", "appelle", "sappelle", "monsieur", "madame",
+    "mr", "mme", "mlle", "docteur", "dr",
+    # English pronouns: the extractor searched OpenMRS for patients called "he" and "his".
+    "he", "his", "him", "she", "her", "hers", "they", "them", "its",
+    # Politeness that trails a name: "de madame Ziani s'il vous plait" yielded "Ziani s'il".
+    "s'il", "sil", "vous", "plait", "please",
 }
 # What makes a date a *birth* date. "ne"/"nee" only counts immediately before "le", because bare
 # "ne" is the French negation and would match half of everything.
@@ -185,8 +248,31 @@ _GCS_RE = re.compile(r"\b(?:gcs|glasgow)\b\D{0,12}(\d{1,2})\b")
 _KARNOFSKY_RE = re.compile(r"\bkarnofsky\b\D{0,12}(\d{1,3})\b")
 _EVM_RE = re.compile(r"\be\s*=?\s*(\d)\b.{0,10}\bv\s*=?\s*(\d)\b.{0,10}\bm\s*=?\s*(\d)\b")
 _IDENTIFIER_RE = re.compile(r"\b(?:identifiant|matricule|id|numero de dossier)\s*:?\s*([A-Z0-9][A-Z0-9\-]{2,19})\b", re.I)
+
+BARE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9\-]{2,19}$")
+
+
+def identifier_shaped(value: Optional[str]) -> Optional[str]:
+    """The value as an identifier, if that is plainly what it is.
+
+    OpenMRS identifiers here look like 1000C6 - short, no spaces, digits present. A name never
+    does. Checked because both the extractor and the model put "1000C6" in `name` when the
+    clinician wrote "le patient 1000C6", and a FHIR name search cannot match an identifier, so the
+    record was reported as not existing. Shared between `_resolve_patient` (which already applied
+    it) and `search_patient`'s own build function (which did not - "cherche le patient 10002T"
+    searched name=10002T and found nothing).
+    """
+    if not value:
+        return None
+    text = str(value).strip()
+    if " " in text or not BARE_IDENTIFIER_RE.match(text):
+        return None
+    return text.upper() if any(char.isdigit() for char in text) else None
 _GENDER_M_RE = re.compile(r"\b(homme|masculin|male|garcon|monsieur|mr)\b")
-_GENDER_F_RE = re.compile(r"\b(femme|feminin|female|fille|madame|mme)\b")
+# "patiente" and "nouvelle patiente" are feminine in French and are how a clinician states the sex
+# without a separate word for it. Measured: "inscris une nouvelle patiente, Fatima Cherif" left
+# gender unset, so the assistant asked for something the sentence had already said.
+_GENDER_F_RE = re.compile(r"\b(femme|feminin|female|fille|madame|mme|patiente)\b")
 
 _MONTHS = {
     "janvier": 1, "fevrier": 2, "mars": 3, "avril": 4, "mai": 5, "juin": 6,
@@ -219,8 +305,18 @@ def _trim_to_name(candidate: str) -> Optional[str]:
     un GCS bas" still yields "walter white". Returns None when nothing survives - an empty name is
     worse than no name, because it would search for everyone.
     """
+    tokens = candidate.split()
+    # Leading stopwords are *skipped*, not treated as the end of the name. The leftmost trigger wins
+    # in the pattern above, so "patient nomme rachid ghezal" hands this "nomme rachid ghezal":
+    # stopping at the first stopword loses the name entirely, and keeping it produced a patient
+    # called "nomme rachid ghezal" in the live database. Titles behave the same way - "madame Ziani"
+    # is Ziani.
+    start = 0
+    while start < len(tokens) and normalise(tokens[start]).strip("'’-") in _NAME_STOPWORDS:
+        start += 1
+
     kept: List[str] = []
-    for token in candidate.split():
+    for token in tokens[start:]:
         if normalise(token).strip("'’-") in _NAME_STOPWORDS:
             break
         kept.append(token)
@@ -354,8 +450,11 @@ def _is_benign_overlap(tasks: List[str]) -> bool:
 
     "affiche le dossier du patient Benali" hits both the summary and the search vocabulary, but
     they are the same request at different stages - a summary is a search followed by a read.
+    Likewise "cherche tous les patients dont les noms commencent par W" hits both search and list
+    vocabulary ("tous les patients" names the scope, not a second request) - all three are
+    read-only lookups that differ only in how many records come back.
     """
-    return set(tasks) <= {TASK_GET_PATIENT_SUMMARY, TASK_SEARCH_PATIENT}
+    return set(tasks) <= {TASK_GET_PATIENT_SUMMARY, TASK_SEARCH_PATIENT, TASK_LIST_PATIENTS}
 
 
 _LABELS = {
@@ -365,6 +464,7 @@ _LABELS = {
     TASK_UPDATE_PATIENT: "mettre a jour un patient",
     TASK_BOOK_APPOINTMENT: "programmer un rendez-vous",
     TASK_RECORD_NEURO_ASSESSMENT: "enregistrer un score neurologique",
+    TASK_LIST_PATIENTS: "lister des patients",
 }
 
 

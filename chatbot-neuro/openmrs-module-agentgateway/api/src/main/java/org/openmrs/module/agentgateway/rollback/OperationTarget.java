@@ -2,11 +2,20 @@ package org.openmrs.module.agentgateway.rollback;
 
 import org.apache.commons.lang.StringUtils;
 
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
+
 /**
  * The parsed form of a logged {@code target_endpoint} ("POST /ws/fhir2/R4/Patient"), which is
  * everything the rollback engine knows about what an operation did without re-reading the body.
  */
 public final class OperationTarget {
+
+	/** The only nested-under-person collections this engine knows how to address by id. */
+	private static final Set<String> PERSON_SUB_RESOURCES = Collections
+			.unmodifiableSet(new HashSet<String>(Arrays.asList("attribute", "name")));
 
 	public enum Family {
 		FHIR, REST, OTHER
@@ -80,8 +89,21 @@ public final class OperationTarget {
 		String resourceType = segments.length > 0 && !segments[0].isEmpty() ? segments[0] : null;
 		// A trailing segment is only an identifier when it is the second one. Anything deeper
 		// (patient/{uuid}/identifier/{uuid}) is a sub-resource this engine does not claim to
-		// understand, and is reported as such rather than guessed at.
+		// understand, and is reported as such rather than guessed at - with one deliberate,
+		// narrow exception just below.
 		String resourceId = segments.length == 2 && !segments[1].isEmpty() ? segments[1] : null;
+
+		if (resourceId == null && segments.length == 4 && "person".equals(segments[0]) && !segments[3].isEmpty()
+				&& PERSON_SUB_RESOURCES.contains(segments[2])) {
+			// person/{uuid}/attribute/{attrId} and person/{uuid}/name/{nameId} - the two paths
+			// update_patient_demographics writes phone and name through as of Phase 20 (fhir2
+			// 1.2.2's own Patient PUT cannot actually change an existing attribute or name value;
+			// see the clinical-agent-service implementation log). This one shape *is* understood
+			// unlike the general case above: the sub-resource id is the operation's real target,
+			// not the person's, and treating it as an unrecognised create meant a phone or name
+			// update could never be reversed, and its before-image was never captured either.
+			resourceId = segments[3];
+		}
 
 		return new OperationTarget(method, path, family, resourceType, resourceId);
 	}

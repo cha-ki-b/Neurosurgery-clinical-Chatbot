@@ -178,3 +178,18 @@ def test_delegated_calls_go_through_the_relay_prefix():
     from app.openmrs_client import RELAY_PATH_PREFIX
 
     assert RELAY_PATH_PREFIX == "/module/agentgateway/relay"
+
+
+def test_a_404_on_a_search_is_not_reported_as_a_missing_patient():
+    """Finding 17. A FHIR search that matches nothing returns 200 with an empty Bundle, so a 404 means
+    the request never reached the API. Reporting it as "introuvable" turned an infrastructure fault
+    into a clinical fact and hid a broken audit filter for a week."""
+    from app.openmrs_client import explain_failure
+
+    searching = explain_failure(404, None, searching=True)
+    assert searching != explain_failure(404, None), "a search 404 reads the same as a missing record"
+    assert "technique" in searching.lower()
+    assert "pas un patient introuvable" in searching.lower()
+
+    # A read of one named record still means what it says.
+    assert explain_failure(404, None) == "Le dossier demande est introuvable dans OpenMRS."

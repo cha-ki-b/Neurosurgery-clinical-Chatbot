@@ -1,15 +1,24 @@
-# Plan — serving MedGemma and validating the assistant with it
+# MedGemma — how it was stood up, and the reference material that's still live
 
-The remaining work, in order, with the exact commands, configuration, code and tests. Written so that
-each step has a stated expected result and a stated failure mode, because most of the difficulty in
-this project has been errors that named the wrong layer.
+> **Status: done, not a plan.** Every step below was written prospectively and is kept in its
+> original "expected result / failure mode" phrasing because that is still useful when repeating or
+> debugging any of it — but as of Phase 24 (2026-08-27), MedGemma 4B on vLLM is the interpreter
+> actually serving chat turns in production (`NLU_ENGINE=medgemma`), Step 8's two items are both
+> done (Phase 22), and `tests/eval_nlu.py` scores **UNSAFE = 0** on both engines, most recently
+> re-confirmed after a `SYSTEM_PROMPT` revision (`IMPLEMENTATION-LOG.md` Finding 35). What's still
+> genuinely useful here going forward: **Step 7**'s measurement methodology (re-run it after any
+> future prompt change) and **Step 9**'s rollback procedure (kept current, cheap, and one command).
+> Everything else is historical record — see `IMPLEMENTATION-LOG.md` for what actually happened at
+> each step, evidence included.
 
-**Scope.** Steps 1–7 stand up the model and validate the four task families through it. Steps 8–9 are
-the non-model items still open. Every step says who does it.
+This was originally the remaining-work plan, in order, with the exact commands, configuration, code
+and tests. Kept in that form because each step states an expected result and a failure mode, and
+most of the difficulty in this project has been errors that named the wrong layer — that framing
+does not stop being useful just because the work finished.
 
-**Where we are.** The assistant works live with the deterministic interpreter: searching, reading and
-creating a patient all function end to end, audited, under the clinician's own privileges. The model
-code is written and tested (110 tests, no GPU required) but has never been run against real weights.
+**Scope, as originally written.** Steps 1–7 stand up the model and validate the four task families
+through it. Steps 8–9 are the non-model items that were still open at the time. Every step says who
+does it.
 
 ---
 
@@ -18,10 +27,10 @@ code is written and tested (110 tests, no GPU required) but has never been run a
 | Prerequisite | State | Who |
 |---|---|---|
 | Docker Engine with the `nvidia` runtime | done (Phase 12) | — |
-| `cerist` in the `docker` group | done; **needs a Claude Code restart** to take effect in this session | operator |
-| MedGemma licence accepted on huggingface.co | **outstanding** | operator |
-| HF read token in `scratchpad/hf_token` | **outstanding** | operator |
-| ~9 GB free disk | 764 GB available | — |
+| `cerist` in the `docker` group | done | operator |
+| MedGemma licence accepted on huggingface.co | done | operator |
+| HF read token in `scratchpad/hf_token` | done | operator |
+| ~9 GB free disk | done at the time; 764 GB was available | — |
 
 The licence is a terms agreement on a personal account, so it is the operator's to accept. Put the
 token in a file rather than pasting it, so it stays out of the transcript:
@@ -269,25 +278,27 @@ not theirs, which is a real limitation of this measurement.
 
 ---
 
-## Step 8 — Non-model items still open
+## Step 8 — Non-model items, as they stood at the time
 
-| Item | What it needs | Blocked on |
+| Item | What it needs | Status |
 |---|---|---|
-| Rollback dry-run | reverse the create of a throwaway patient from the operation log page | operator; **least-exercised code in the system** |
-| Read-only refusal | a test account with `chat.use` but not `chat.write` | operator |
-| `book_appointment` | a decision: book into pre-existing staffed slots, or is this really a request/referral? | department |
-| GCS / Karnofsky | `patientview` REST resources keyed on uuid (§4.3) | Java work on Server 1 |
-| `null null` in the header | give the `admin` account a first and last name | operator |
-| Orthanc credentials in `OHIF/ohif-app-config.js` | in cleartext; travels with the viewer to Server 1 | operator |
+| Rollback dry-run | reverse the create of a throwaway patient from the operation log page | **done, Phase 22** — reversed a real create, confirmed at the database |
+| Read-only refusal | a test account with `chat.use` but not `chat.write` | **done, Phase 22** — confirmed no write call reached OpenMRS |
+| `book_appointment` | a decision: book into pre-existing staffed slots, or is this really a request/referral? | still open — department decision, and now also blocked on Findings 6/11/36, see `IMPLEMENTATION-LOG.md` |
+| GCS / Karnofsky | `patientview` REST resources keyed on uuid (§4.3) | still open — Java work on Server 1 |
+| `null null` in the header | give the `admin` account a first and last name | Phase 22 fixed the global page header occurrence; **re-opened 2026-08-27** for a second occurrence inside the chat widget itself, not yet investigated — see `HANDOFF.md` |
+| Orthanc credentials in `OHIF/ohif-app-config.js` | in cleartext; travels with the viewer to Server 1 | still open, on hold per `IMPLEMENTATION-LOG.md` Phase 23 |
 
-The first two are worth doing **before** relying on the model in anger: they are what make a model's
-mistakes survivable, and neither depends on which interpreter is running.
+The first two were worth doing before relying on the model in anger, and were: they are what make a
+model's mistakes survivable, and neither depends on which interpreter is running.
 
 ---
 
 ## Step 9 — Rollback plan for the whole model change
 
-If MedGemma proves unreliable or the GPU path unstable, reverting is complete and cheap:
+Kept live as a standing procedure, not a pre-launch contingency — MedGemma has been running in
+production since Phase 19 without needing it, but if it ever does prove unreliable or the GPU path
+unstable, reverting is complete and cheap:
 
 ```bash
 sed -i 's/^NLU_ENGINE=.*/NLU_ENGINE=rules/' ~/server2-stack/.env

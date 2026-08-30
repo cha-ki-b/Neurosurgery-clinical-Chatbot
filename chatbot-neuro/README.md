@@ -17,10 +17,12 @@ Two components:
 | `openmrs-module-agentgateway/` | Server 1, inside OpenMRS | The entire OpenMRS-side footprint: chat relay, delegated-token minting and verification, the audit filter, `agentgateway_operation_log`, and admin review/rollback. No clinical logic, no neurosurgery-specific logic. |
 | `clinical-agent-service/` | Server 2 | FastAPI. One endpoint, `POST /chat`. Holds no OpenMRS account and no durable store. |
 
-**Status: in deployment against the live instance.** Both servers are up and talking; the
-module fix in 1.1.1 was required before a single chat turn could complete. See
-[`IMPLEMENTATION-LOG.md`](IMPLEMENTATION-LOG.md) for what was found, what changed and what is
-still outstanding, and [What still needs doing](#what-still-needs-doing) below.
+**Status: live against the hospital's real OpenMRS.** Both servers are up and talking, module
+`agentgateway 1.1.4` is installed and running on Server 1, and the model interpreter (MedGemma on
+vLLM, `NLU_ENGINE=medgemma`) is the one actually serving chat turns today — Phase 3 is not future
+work, it is what is running. See [Current state](#current-state) below for exactly which tasks are
+confirmed live, [`IMPLEMENTATION-LOG.md`](IMPLEMENTATION-LOG.md) for the evidence, and
+[What still needs doing](#what-still-needs-doing) for what is genuinely still open.
 
 ---
 
@@ -147,20 +149,26 @@ The hospital: **Server 1 `10.0.211.249`** (`openmrs` / `orthanc` / `viewer`.hosp
 cd openmrs-module-agentgateway && mvn clean package
 ```
 
-Produces `omod/target/agentgateway-1.1.0.omod`. Java 8 and Maven, matching the deployment
-(OpenMRS 2.12.2 / platform 2.5.9, WAR 2.4.3, Tomcat 7).
+Produces `omod/target/agentgateway-1.1.4.omod` — current deployed version; see
+[`CHANGELOG.md`](openmrs-module-agentgateway/CHANGELOG.md) for the full 1.1.0 → 1.1.4 history. Java
+8 and Maven, matching the deployment (OpenMRS 2.12.2 / platform 2.5.9, WAR 2.4.3, Tomcat 7).
 
 Install through **Administration → Manage Modules → Add or Upgrade Module**. Liquibase creates
 `agentgateway_operation_log` on start and the activator generates the signing key pair.
 
-> **If you installed 1.0.0, upgrading is required, not optional.** In 1.0.0 the app-framework
-> definitions were in a file named `agentgateway_app.json`. OpenMRS keys that loader on the file
-> *name*: `*app.json` is parsed as `AppDescriptor`, `*extension.json` as `Extension`. Those are
-> different classes, the file held extensions, and appframework's Jackson 1.x rejects unknown
-> properties — so it was dropped at load with one line in the log. Everything else worked, which
-> is exactly why it was confusing: the module started, its settings appeared, its endpoints
-> answered, and no UI rendered anywhere. `ModuleWiringTest` now fails the build if that naming
-> rule is ever broken again.
+> **If you are installing from anything older than 1.1.4, upgrading first is required, not
+> optional** — each point release since 1.1.0 fixed a deployment-blocking defect (accounts with no
+> username could not get a token; the fhir2 relay path 401'd; a stylesheet 404'd; the 1.0.0
+> app-framework file naming bug below), not a cosmetic change. Full detail per version in
+> `CHANGELOG.md`.
+>
+> The 1.0.0-specific bug, for context: its app-framework definitions were in a file named
+> `agentgateway_app.json`. OpenMRS keys that loader on the file *name*: `*app.json` is parsed as
+> `AppDescriptor`, `*extension.json` as `Extension`. Those are different classes, the file held
+> extensions, and appframework's Jackson 1.x rejects unknown properties — so it was dropped at load
+> with one line in the log. Everything else worked, which is exactly why it was confusing: the
+> module started, its settings appeared, its endpoints answered, and no UI rendered anywhere.
+> `ModuleWiringTest` now fails the build if that naming rule is ever broken again.
 
 ### 2. Configure OpenMRS
 
@@ -206,9 +214,10 @@ The certificate is issued by the **existing hospitalCA on Server 1** rather than
 authority — the CA key never travels, only the signing request does.
 
 The step that is easy to miss and impossible to diagnose from the chat: **import hospitalCA into
-the OpenMRS container's Java trust store**. Java keeps its own list, the hospital CA is not on it,
-and without the import every relay fails as `SSLHandshakeException` while the clinician just sees
-"assistant indisponible". `2-sign-agent-csr.sh` prints the exact commands.
+the OpenMRS container's Java trust store**, or every relay fails as `SSLHandshakeException` while
+the clinician just sees "assistant indisponible". `2-sign-agent-csr.sh` prints the exact commands —
+see [DEPLOYMENT-GUIDE.md](DEPLOYMENT-GUIDE.md) for the full walkthrough of why (Java keeps its own
+certificate list, separate from the OS's).
 
 `clinical-agent-service/docker-compose.yml` remains for single-machine development — no TLS,
 loopback only. Do not run it on Server 2: it publishes the raw port, which makes the proxy's
@@ -303,7 +312,7 @@ French and English, conversational, with the clarification loop carrying context
 | Afficher un dossier et les derniers passages | `GET Patient/{id}`, `GET Encounter?patient=…` | no |
 | Créer un patient | `POST /ws/fhir2/R4/Patient` | **yes** — confirmation + duplicate warning |
 | Mettre à jour les données administratives | `PUT /ws/fhir2/R4/Patient/{id}` | **yes** — confirmation |
-| Programmer un rendez-vous | `POST /ws/fhir2/R4/Appointment` | **yes** — only if `fhir2` advertises Appointment |
+| Programmer un rendez-vous | `POST /ws/fhir2/R4/Appointment` | **yes** — blocked on this instance, see [Current state](#current-state) |
 | Enregistrer un GCS / Karnofsky | `POST /ws/rest/v1/patientview/neuroassessment` | **yes** — see the prerequisite below |
 
 A worked example:
@@ -350,39 +359,42 @@ at what it reversed. Nothing is ever edited out of the trail.
 
 ## Current state
 
-Working live against the hospital's OpenMRS as of 2026-08-18: searching for a patient, reading a
-record, and **creating a patient from a French sentence** — with a duplicate warning, an explicit
-confirmation, an OpenMRS-issued identifier and a full audit row. Updating is implemented but not yet
-exercised live. Booking an appointment and recording a neuro score are blocked for reasons that are
-not code — see [`IMPLEMENTATION-LOG.md`](IMPLEMENTATION-LOG.md) Findings 6 and 11, and §4.3.
+Working live against the hospital's OpenMRS, most recently re-confirmed 2026-08-27: searching for a
+patient, reading a record, **creating a patient from a French sentence** — with a duplicate warning,
+an explicit confirmation, an OpenMRS-issued identifier and a full audit row — and **updating a
+patient's phone number and name**, verified by reading the database back after the call, not just
+trusting the response status (Phase 20). A rollback has been dry-run for real on a throwaway patient
+and reversed it correctly (Phase 22). The interpreter actually answering chat turns today is
+**MedGemma 4B on vLLM** (`NLU_ENGINE=medgemma`), not the deterministic fallback — see
+[Phase 3 below](#the-nlu-engines-rules-and-medgemma).
 
-Getting there took ten findings, most of them properties of this deployment rather than of the code:
-they are all recorded in the implementation log, with the evidence for each.
+Booking an appointment and recording a neuro score remain blocked, for reasons that are not agent
+code:
+
+- **Booking** needs two independent things fixed first: this hospital's `fhir2` does not expose the
+  `Appointment` resource at all (Findings 6 and 11), and separately, OpenMRS's own global property
+  `timezone.conversions=false` breaks the *native* appointment scheduling UI's slot search
+  regardless of the agent (Finding 36, 2026-08-27) — so fixing the first alone would not be enough.
+- **Recording a GCS/Karnofsky score** needs `patientview` exposed over `webservices.rest` first —
+  see [Prerequisite for the neurosurgery-specific tools](#prerequisite-for-the-neurosurgery-specific-tools-architecture-43)
+  below.
+
+All of the above, with the evidence for each finding, is in
+[`IMPLEMENTATION-LOG.md`](IMPLEMENTATION-LOG.md).
 
 ## What still needs doing
 
 ### Before this can be used on the live instance
 
-1. **Deploy and smoke-test it.** Module 1.1.1 is built but not yet installed; the Server 2
-   stack is running. Confirm that module filters run after `OpenmrsFilter` on this Tomcat build —
-   the design relies on a `UserContext` already existing when the audit filter runs, and it is
-   worth confirming rather than assuming.
+1. **Confirm the `Rapport_3` privilege question** (§8 #7) if `medreport.imaging.*` ships alongside —
+   the one item from the original deployment checklist that is still genuinely open; deployment
+   itself, the identifier configuration, and a rollback dry-run are all done (see
+   [Current state](#current-state)).
 
-   Two faults found during deployment are recorded in
-   [`IMPLEMENTATION-LOG.md`](IMPLEMENTATION-LOG.md): tokens could not be minted for accounts
-   without a username (fixed in 1.1.1), and Server 2's `.env` held the signing *private* key
-   where the public key belongs (being rotated). Neither was visible from the test suite, because
-   both are properties of the deployment rather than of the code under test.
-
-   Note also that `openmrs-app` runs with **no volume mounts**: the installed module and the
-   hospitalCA truststore import live in the container's writable layer, so recreating the
-   container discards both. `docker restart` is safe; `docker compose down && up` is not.
-2. **Check `POST /ws/fhir2/R4/Patient` against the real instance.** Creating a patient needs an
-   identifier of a type this hospital issues. Set `OPENMRS_PATIENT_IDENTIFIER_SYSTEM` accordingly
-   and confirm the created patient is complete, not just accepted.
-3. **Dry-run a rollback** on a throwaway patient before letting anyone use the write path, per §9
-   phase 4.
-4. **Confirm the `Rapport_3` privilege question** (§8 #7) if `medreport.imaging.*` ships alongside.
+   One deployment property worth knowing for any future redeploy: `openmrs-app` runs with **no
+   volume mounts**, so the installed module and the hospitalCA truststore import live in the
+   container's writable layer and would be discarded by recreating it. `docker restart` is safe;
+   `docker compose down && up` is not.
 
 ### Prerequisite for the neurosurgery-specific tools (architecture §4.3)
 
@@ -399,27 +411,36 @@ Once that lands: set `PATIENTVIEW_TOOLS_ENABLED=true` **and** add `/ws/rest/v1/p
 This is additive to `patientview` — new REST classes, no change to existing pages or services —
 and is what any external integration would need, chatbot or not.
 
-### Phase 3 (the model) — code complete, awaiting the GPU
+### The NLU engines: `rules` and `medgemma`
 
-`MedGemmaNlu` (`app/nlu/medgemma.py`) implements the same `NluEngine` interface as the rules engine
-and is selected with `NLU_ENGINE=medgemma`. Its output is constrained to a JSON schema **generated
-from the tool registry** (`app/nlu/schema.py`), so it cannot name a task that does not exist. Three
-checks do not trust it: descriptive phrasing never becomes a write, slot values it reports but the
-sentence does not contain are dropped on writes, and an unknown task is refused rather than repaired.
-Any model failure falls back to the rules engine for that turn.
+`MedGemmaNlu` (`app/nlu/medgemma.py`) implements the same `NluEngine` interface as the deterministic
+rules engine and is selected with `NLU_ENGINE=medgemma` — **this is the engine actually running in
+production today**, on vLLM, not a future plan. Its output is constrained to a JSON schema
+**generated from the tool registry** (`app/nlu/schema.py`), so it cannot name a task that does not
+exist. Three checks do not trust it: descriptive phrasing never becomes a write, slot values it
+reports but the sentence does not contain are dropped on writes, and an unknown task is refused
+rather than repaired. Any model failure falls back to the deterministic `rules` engine for that turn
+— a dead GPU narrows the assistant's understanding of language, it does not take the chat offline.
+
+§8 #1's question — whether tool selection is reliable at 4B on real French clinical phrasing — has
+an answer, not just a plan to get one: `tests/eval_nlu.py`'s corpus scores **UNSAFE = 0** on both
+engines, most recently re-confirmed 2026-08-27 after a `SYSTEM_PROMPT` revision
+(`IMPLEMENTATION-LOG.md` Finding 35). That corpus is still small and was written by the people
+building the system, not by the clinicians who will use it — growing it with real collected
+phrasing, and re-running the measurement after any further prompt change, is the ongoing work here,
+not standing up the model in the first place. The methodology and the rollback procedure if MedGemma
+ever needs to be turned off are in [`MEDGEMMA-PLAN.md`](MEDGEMMA-PLAN.md).
 
 vLLM is a compose overlay (`../server2-stack/docker-compose.vllm.yml`), not part of the base stack:
-with `NLU_ENGINE=rules` the assistant runs with no GPU at all.
+`NLU_ENGINE=rules` still runs the assistant with no GPU at all, which is what a fresh
+`.env.example`-based install defaults to.
 
-Outstanding: the weights are not downloaded and the model has never been served. §8 #1 — whether
-tool selection is reliable at 4B on real French clinical phrasing — remains an open empirical
-question, and the answer is a measurement, not an opinion. The plan for taking it from here, with the
-exact commands, configuration and tests, is [`MEDGEMMA-PLAN.md`](MEDGEMMA-PLAN.md).
+### Writes (create, update, book, record)
 
-### Phase 4 (agent, writes)
-
-The write path is implemented and tested here, so Phase 4 is largely validation on the real
-instance rather than new code: the confirmation gate, the audit trail and rollback all exist.
+The write path — confirmation gate, audit trail, rollback — is implemented, tested, and for
+`create_patient`/`update_patient_demographics` confirmed live against the real instance (see
+[Current state](#current-state)). `book_appointment` and `record_neuro_assessment` remain blocked,
+each for its own already-diagnosed, non-code reason — same section.
 
 ### Known limitations
 

@@ -45,15 +45,20 @@ mvn clean package
 ```
 
 **You should see:** `BUILD SUCCESS`, and a new file at
-`omod/target/agentgateway-1.1.0.omod`.
+`omod/target/agentgateway-1.1.4.omod` — current version; see
+[`CHANGELOG.md`](openmrs-module-agentgateway/CHANGELOG.md) for the full history.
 
 ### A2. Install it into OpenMRS
 
 Open OpenMRS in a browser. Go to **Administration → Manage Modules → Add or Upgrade Module**.
-Upload `agentgateway-1.1.0.omod`.
+Upload `agentgateway-1.1.4.omod`.
 
-> If you already installed version 1.0.0, upload 1.1.0 the same way. It replaces the old one.
-> **You must do this** — 1.0.0 has the bug that hides the chat window.
+> If you already have an older version installed, upload 1.1.4 the same way — it replaces the old
+> one. **You must do this**: 1.0.0 has the bug that hides the chat window entirely, and each release
+> since fixed its own deployment-blocking or usability defect (1.1.1: accounts with no username
+> could not get a token; 1.1.2: every `fhir2` call 401'd before the audit filter could authenticate
+> it; 1.1.3: the audit log's "who acted" column was blank; 1.1.4: the stylesheet 404'd on every
+> page). See `CHANGELOG.md` for exactly what changed in each.
 
 **You should see:** `agentgateway` in the module list, marked **Started**.
 
@@ -407,7 +412,7 @@ You should also see:
 
 | Check | How |
 |---|---|
-| Is the module version 1.1.0? | Administration → Manage Modules. **1.0.0 cannot show the chat** — that was the bug. |
+| Is the module at least 1.1.0? | Administration → Manage Modules. **1.0.0 cannot show the chat at all** — that was the bug. Current version is 1.1.4; anything older may be missing later fixes too, see `CHANGELOG.md`. |
 | Does your user have the privilege? | Administration → Manage Roles → your role → `App: agentgateway.chat.use` |
 | Does the page itself work? | Open `https://openmrs.hospital.lan/openmrs/agentgateway/chat.page` directly. If this works but the box does not appear, it is the privilege or the module version. |
 
@@ -476,17 +481,25 @@ at every step and every action written down.
 
 ## Known limitations, so they do not surprise you
 
-**Booking an appointment does not work**, and it is not a matter of switching it on. `fhir2` on this
-installation exposes no `Appointment` resource at all, and the `appointmentscheduling` module models
-booking as putting a patient into a **time slot that an administrator created in advance** — there is
-no "book at this date and time" operation. Two questions have to be settled before it can be built:
-whether provider schedules are configured here at all, and whether "book an appointment" in the brief
-means this or something closer to a request or referral. See `IMPLEMENTATION-LOG.md` Findings 6 and 11.
+**Booking an appointment does not work**, and it is not a matter of switching it on — and there are
+**two independent reasons**, both already diagnosed. First, `fhir2` on this installation exposes no
+`Appointment` resource at all, and the `appointmentscheduling` module models booking as putting a
+patient into a **time slot that an administrator created in advance** — there is no "book at this
+date and time" operation (Findings 6 and 11). Second, and unrelated to the agent entirely: OpenMRS's
+own native scheduling UI is also broken on this instance — searching for a slot always returns "no
+timezone available" — traced to the global property `timezone.conversions=false` (Finding 36,
+2026-08-27). Fixing the first without the second still leaves booking broken. Two questions have to
+be settled before booking can be built end to end: whether provider schedules are configured here at
+all, and whether "book an appointment" in the brief means this or something closer to a request or
+referral. See `IMPLEMENTATION-LOG.md` Findings 6, 11 and 36.
 
-**`null null` appears at the top of every page**, including the assistant's. That is not the
-assistant: it is OpenMRS's own page header printing the logged-in user's first and last name, and the
-`admin` account has neither on its person record. Give that account a name and it goes away. The same
-missing name is why the assistant's audit log needed a fallback to display who acted (Finding 12).
+**`null null` may appear at the top of a page.** OpenMRS's own global page header prints the
+logged-in user's first and last name, and printed `null null` for `admin` until Phase 22 gave that
+account a name on its person record — fixed there. A second, separate `null null` was observed
+2026-08-27 *inside* the assistant's own chat widget (not the global header), on the same `admin`
+account, and has not yet been investigated — it is not established whether it is the same underlying
+cause resurfacing in a different template or an independent bug. See `HANDOFF.md`. The missing name
+is also why the assistant's audit log needed a fallback to display who acted (Finding 12).
 
 `record_neuro_assessment` (Glasgow / Karnofsky) reports itself as **unavailable**, and that is
 correct, not a bug. The existing `patientview` endpoints identify a patient by an internal

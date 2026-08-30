@@ -29,6 +29,7 @@ TASK_CREATE_PATIENT = "create_patient"
 TASK_UPDATE_PATIENT = "update_patient_demographics"
 TASK_BOOK_APPOINTMENT = "book_appointment"
 TASK_RECORD_NEURO_ASSESSMENT = "record_neuro_assessment"
+TASK_LIST_PATIENTS = "list_patients"
 
 
 @dataclass

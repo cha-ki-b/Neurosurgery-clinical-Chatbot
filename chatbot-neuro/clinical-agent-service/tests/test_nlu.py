@@ -193,3 +193,45 @@ def test_an_appointment_date_is_not_recorded_as_a_birth_date():
 )
 def test_an_explicit_birth_cue_still_fills_the_birth_date(prompt, expected):
     assert extract_slots(prompt).get("birthdate") == expected
+
+
+# --- Finding 18: a trigger word is never part of the name ---------------------------------
+
+
+@pytest.mark.parametrize(
+    "prompt,expected",
+    [
+        # The live defect: created patient 1000C6 named "nomme rachid ghezal".
+        ("Crée nouveau patient nommé rachid ghezal", "rachid ghezal"),
+        ("cree un patient nomme Ahmed Ziani", "Ahmed Ziani"),
+        ("retrouve le dossier de madame Ziani", "Ziani"),
+        ("cherche le patient appelé Benali", "Benali"),
+    ],
+)
+def test_the_trigger_word_is_not_captured_into_the_name(prompt, expected):
+    assert extract_slots(prompt).get("name") == expected
+
+
+def test_english_pronouns_are_not_patient_names():
+    """The extractor searched OpenMRS for patients called "he" and "his"."""
+    for prompt in ("cherche le patient he", "affiche le dossier du patient his"):
+        assert not extract_slots(prompt).get("name")
+
+
+# --- Finding 21: deletion is recognised so it can be refused by name ----------------------
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    ["Supprime le patient avec ID 1000C6", "supprime un patient", "efface ce dossier",
+     "supprime tous les patients"],
+)
+def test_deletion_is_recognised(prompt):
+    from app.nlu.rules import reads_as_deletion
+    assert reads_as_deletion(prompt)
+
+
+@pytest.mark.parametrize("prompt", ["cree un patient nomme Ahmed", "cherche Benali", "mets a jour le telephone"])
+def test_ordinary_requests_are_not_read_as_deletion(prompt):
+    from app.nlu.rules import reads_as_deletion
+    assert not reads_as_deletion(prompt)

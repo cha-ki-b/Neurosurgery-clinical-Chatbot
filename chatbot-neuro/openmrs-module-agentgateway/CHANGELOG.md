@@ -1,5 +1,37 @@
 # Changelog — Clinical Agent Gateway (`agentgateway`)
 
+## 1.1.4 (rebuilt) — Phase 22, after the dated 1.1.4 release below
+
+`OperationTarget`'s rollback path parsing fixed; version string intentionally left at 1.1.4 since
+this was an in-place correction during active deployment work, not a separate release, and the exact
+date was not recorded at the time (bracketed by Phase 21 and Phase 23, which HANDOFF.md dates
+2026-08-26). Covered by five new `OperationTargetTest` cases (module test count 65 → 69). See
+`IMPLEMENTATION-LOG.md` Phase 22 for the defect and the fix. Noted here, after the fact, because a
+rebuild that changes behaviour without changing the version string is exactly the kind of thing this
+file exists to make findable — and the omission is itself worth learning from: **give a rebuild that
+changes behaviour a new version string next time**, even a `-p1` style patch marker, so this file
+does not need forensic reconstruction to stay accurate.
+
+## 1.1.4 — 2026-08-24
+
+Fixes one defect with an outsized effect. No schema change, no new privilege, no API change.
+
+### Fixed
+
+- **The stylesheet had never loaded, on any page.** `ui.includeCss(provider, file)` resolves to
+  `/moduleResources/<provider>/styles/<file>`, while `ui.includeJavascript` resolves to
+  `.../scripts/<file>`. The javascript was in `resources/scripts/` and loaded; `agentgateway.css` was
+  in `resources/css/` and returned **404** — on the chat page, the patient-dashboard widget and the
+  administrator's operation log alike. Verified on the running server before moving anything.
+
+  The chat therefore worked perfectly while being completely unstyled, which was reported as "there is
+  no visual distinction between the clinician's messages and the assistant's". There always was:
+  `.agent-message-user` is right-aligned on a blue ground, `.agent-message-bot` on a light one. They
+  were simply never served.
+
+  `agentgateway.css` moved to `resources/styles/`, and `ModuleWiringTest` now asserts it is where
+  `includeCss` looks — a 404 on a stylesheet is invisible until someone looks at the page.
+
 ## 1.1.3 — 2026-08-18
 
 Audit-log readability. No behavioural change to the chat, the security model or the schema.

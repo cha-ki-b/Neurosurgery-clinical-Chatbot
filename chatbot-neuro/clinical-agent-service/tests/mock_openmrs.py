@@ -185,12 +185,82 @@ def build_mock_openmrs(public_key_b64: str) -> FastAPI:
         state["patients"][patient_id] = stored
         return JSONResponse({"uuid": patient_id, "display": f"{identifiers[0]['identifier']} - {given} {names[0]['familyName']}"}, status_code=201)
 
+    @app.post("/ws/rest/v1/person/{person_id}/attribute")
+    async def create_person_attribute(person_id: str, body: Dict[str, Any]) -> Response:
+        """A patient's first phone number - webservices.rest, not FHIR.
+
+        A FHIR PUT that adds a telecom entry with no id reproduces Finding 10's translator bug
+        (setUuid(getId()) unconditional); one that carries an existing entry's id is silently
+        dropped instead (fhir2 1.2.2 builds a fresh PersonAttribute from every incoming
+        ContactPoint, and a Hibernate Set treats same-uuid as already-present). Neither works, so
+        this - like create_patient - goes through webservices.rest, verified directly against the
+        real deployment to actually persist.
+        """
+        patient = state["patients"].get(person_id)
+        if patient is None:
+            return JSONResponse({"error": {"message": "Person not found"}}, status_code=404)
+        attribute_id = str(uuid.uuid4())
+        telecom = list(patient.get("telecom") or [])
+        telecom.append({"id": attribute_id, "value": body.get("value")})
+        patient["telecom"] = telecom
+        return JSONResponse({"uuid": attribute_id, "value": body.get("value")}, status_code=201)
+
+    @app.post("/ws/rest/v1/person/{person_id}/attribute/{attribute_id}")
+    async def update_person_attribute(person_id: str, attribute_id: str, body: Dict[str, Any]) -> Response:
+        patient = state["patients"].get(person_id)
+        if patient is None:
+            return JSONResponse({"error": {"message": "Person not found"}}, status_code=404)
+        telecom = list(patient.get("telecom") or [])
+        for entry in telecom:
+            if entry.get("id") == attribute_id:
+                entry["value"] = body.get("value")
+                break
+        else:
+            return JSONResponse({"error": {"message": "Attribute not found"}}, status_code=404)
+        patient["telecom"] = telecom
+        return JSONResponse({"uuid": attribute_id, "value": body.get("value")})
+
+    @app.post("/ws/rest/v1/person/{person_id}/name")
+    async def create_person_name(person_id: str, body: Dict[str, Any]) -> Response:
+        patient = state["patients"].get(person_id)
+        if patient is None:
+            return JSONResponse({"error": {"message": "Person not found"}}, status_code=404)
+        name_id = str(uuid.uuid4())
+        given = body.get("givenName")
+        names = list(patient.get("name") or [])
+        names.append({"id": name_id, "family": body.get("familyName"), "given": [given] if given else []})
+        patient["name"] = names
+        return JSONResponse({"uuid": name_id}, status_code=201)
+
+    @app.post("/ws/rest/v1/person/{person_id}/name/{name_id}")
+    async def update_person_name(person_id: str, name_id: str, body: Dict[str, Any]) -> Response:
+        """A patient's existing name - webservices.rest, not FHIR, for the same reason as the
+        attribute endpoints above: a FHIR PUT with the existing PersonName's id is silently
+        dropped rather than applied (PersonNameTranslatorImpl - one of the three translators
+        Finding 10 already named - is fed a fresh `PersonName()` per incoming entry, not the
+        managed one)."""
+        patient = state["patients"].get(person_id)
+        if patient is None:
+            return JSONResponse({"error": {"message": "Person not found"}}, status_code=404)
+        names = list(patient.get("name") or [])
+        for entry in names:
+            if entry.get("id") == name_id:
+                if "familyName" in body:
+                    entry["family"] = body["familyName"]
+                if "givenName" in body:
+                    entry["given"] = [body["givenName"]] if body["givenName"] else []
+                break
+        else:
+            return JSONResponse({"error": {"message": "Name not found"}}, status_code=404)
+        patient["name"] = names
+        return JSONResponse({"uuid": name_id})
+
     @app.get("/ws/fhir2/R4/metadata")
     async def metadata() -> Dict[str, Any]:
         return CAPABILITY_STATEMENT
 
     @app.get("/ws/fhir2/R4/Patient")
-    async def search_patients(name: str = "", identifier: str = "") -> Dict[str, Any]:
+    async def search_patients(name: str = "", identifier: str = "", gender: str = "") -> Dict[str, Any]:
         # Matches on any name part, the way FHIR's `name` search parameter does - "Amine Benali"
         # has to find a patient recorded as family "Benali", given "Amine".
         if identifier:
@@ -204,13 +274,19 @@ def build_mock_openmrs(public_key_b64: str) -> FastAPI:
                     for ident in (patient.get("identifier") or [])
                 )
             ]
-        else:
+        elif name:
             needle_parts = [part for part in name.lower().split() if part]
             matches = [
                 patient
                 for patient in state["patients"].values()
                 if needle_parts and all(part in _label(patient).lower() for part in needle_parts)
             ]
+        else:
+            # Neither a name nor an identifier: a list, filtered only by whatever else was given
+            # (list_patients sends nothing but `gender`, when the clinician asked for one).
+            matches = list(state["patients"].values())
+        if gender:
+            matches = [patient for patient in matches if patient.get("gender") == gender]
         return {
             "resourceType": "Bundle",
             "type": "searchset",

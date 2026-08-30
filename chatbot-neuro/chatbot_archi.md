@@ -3,7 +3,13 @@
 **Project:** OpenMRS–Orthanc Integration, Neurosurgery Department, CHU Blida
 **Scope:** Part A of the original combined document — a conversational agent that performs OpenMRS operations from natural-language prompts, built as a fully independent service.
 **Companion document:** `reportmed_archi.md` covers Part B — the two report-generation sub-features (SF2, SF3).
-**Status:** Draft for team review — supersedes `medreport-architecture.md`, not yet implemented.
+**Status:** Original design document, frozen text — **superseded as a status source by
+`IMPLEMENTATION-LOG.md` and `HANDOFF.md`**, which reflect what was actually built. §9's build order
+below now describes history for Phases 0-2, not a plan: Phases 2-4 (agent foundation, read-only
+agent, write-capable agent) are all substantially live against the hospital's real OpenMRS as of
+2026-08-27, not merely "IN VALIDATION." Kept here as the original design intent — read
+`IMPLEMENTATION-LOG.md` for what changed on contact with the real deployment, and where this
+document's assumptions turned out right or wrong.
 
 > This file is a split of the original combined document `Chatbot_and_report_architecture.md`. Nothing has been removed or reworded — content concerning the Agent (Part A) is collected here; content concerning the report-generation sub-features (Part B) is in `reportmed_archi.md`. Cross-cutting sections (diagrams, build order) are reproduced in both files for readability.
 
@@ -381,9 +387,9 @@ The Agent redesign changes the safe _sequence_ of work more than it changes the 
 
 1. **Phase 0 (report module):** Report Generation Service + CHU Blida `.docx` template + PDF preview — unchanged, no AI involved. **DONE** — see `reportmed_archi.md`.
 2. **Phase 1 (SF3, report module):** imaging observation reports — unchanged, validates the rendering pipeline and privilege pattern in isolation. **IN VALIDATION** — see `reportmed_archi.md`.
-3. **Phase 2 (Agent foundation, no LLM yet):** build `agentgateway` — chat relay, JWT minting/verification via the `oauth2login` mechanism, the audit filter, and `agent_operation_log` — and exercise it with a stub caller standing in for the Agent. This proves the security model (ADR-9, ADR-5) before any model is involved.
-4. **Phase 3 (Agent, read-only):** stand up the Clinical Agent Service on Server 2 with the "get information" task family only — no writes possible yet. Validates the full round trip, the clarification loop (CA3), and failure reporting (CA8) with zero patient-safety risk.
-5. **Phase 4 (Agent, writes):** enable add-patient / update-patient / book-appointment task families, with the confirm-before-write gate (ADR-2) and rollback (ADR-11) both tested end-to-end before this phase is considered done — this is the highest-risk phase and should not ship without a rollback dry run.
+3. **Phase 2 (Agent foundation, no LLM yet):** build `agentgateway` — chat relay, JWT minting/verification via the `oauth2login` mechanism, the audit filter, and `agent_operation_log` — and exercise it with a stub caller standing in for the Agent. This proves the security model (ADR-9, ADR-5) before any model is involved. **DONE** — deployed and live as `agentgateway 1.1.4`, see `IMPLEMENTATION-LOG.md`.
+4. **Phase 3 (Agent, read-only):** stand up the Clinical Agent Service on Server 2 with the "get information" task family only — no writes possible yet. Validates the full round trip, the clarification loop (CA3), and failure reporting (CA8) with zero patient-safety risk. **DONE, and gone further than "read-only":** MedGemma 4B on vLLM is the live interpreter (`NLU_ENGINE=medgemma`), not just the deterministic stand-in this phase originally scoped — see `IMPLEMENTATION-LOG.md` Finding 35/Phase 24 and `MEDGEMMA-PLAN.md`.
+5. **Phase 4 (Agent, writes):** enable add-patient / update-patient / book-appointment task families, with the confirm-before-write gate (ADR-2) and rollback (ADR-11) both tested end-to-end before this phase is considered done — this is the highest-risk phase and should not ship without a rollback dry run. **Mostly done:** add-patient and update-patient confirmed live, rollback dry-run done (Phase 22). `book-appointment` remains blocked, but on deployment-specific grounds unrelated to this phase's own gates — see `IMPLEMENTATION-LOG.md` Findings 6, 11, 36.
 6. **Phase 5 (SF2, report module):** dashboard button — unchanged, low priority, can slot in any time after Phase 0. See `reportmed_archi.md`.
 
 ---

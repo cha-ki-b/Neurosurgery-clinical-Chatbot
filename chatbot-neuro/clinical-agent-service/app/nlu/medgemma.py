@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -54,39 +55,107 @@ _EXTRACTOR_ONLY_SLOTS = {"gender", "gcs_total", "karnofsky"}
 # Below this, a substring match is coincidence rather than evidence.
 _MIN_CORROBORATION_CHARS = 3
 
+
+def _has_no_letters(value: str) -> bool:
+    """True for a value that cannot possibly be a person's name.
+
+    A name always has at least one letter; a bare phone number does not. Needed because the
+    substring corroboration check below proves too much on its own: "mets a jour son telephone a
+    0666777888" has no name in it at all, but the model returned slots={"name": "0666777888",
+    "phone": "0666777888"} - and "0666777888" *is* a substring of the sentence, so corroboration
+    alone waved the phone number through as a name, which then got searched as a patient
+    identifier instead of the anaphora target the sentence actually meant.
+    """
+    return not any(char.isalpha() for char in value)
+
 # Free-text slots where the model's answer is kept over the extractor's. The regexes cut names on
 # fixed word counts and swallow politeness ("madame Ziani s'il"); the model reads the name.
 _MODEL_WINS_SLOTS = {"name"}
 
-SYSTEM_PROMPT = """Tu es l'interprete d'un assistant clinique dans un hopital, service de \
-neurochirurgie. Tu ne parles pas au clinicien et tu n'executes rien : tu lis UNE phrase et tu dis \
-quelle tache elle demande et quelles informations elle contient.
+# The model is told, in its own prompt, that it is "un classificateur de phrases, pas un
+# assistant". That framing must never reach a clinician - measured, it leaked into the
+# clarification for an out-of-scope turn ("que peux-tu faire ?" -> "Je suis un classificateur de
+# phrases..."), which is confusing and exposes the prompt engineering. A clarification containing
+# this vocabulary is dropped rather than shown (Finding 33).
+_FRAMING_LEAK_RE = re.compile(
+    r"classificateur|classifie|categorie|un autre programme|je ne rends aucun service", re.IGNORECASE
+)
 
-Taches possibles :
+SYSTEM_PROMPT = """Tu es un CLASSIFICATEUR de phrases, pas un assistant. Tu ne rends aucun service \
+et tu ne refuses jamais rien : tu lis une phrase en francais et tu produis un objet JSON qui la \
+range dans une categorie. Un autre programme fait le travail ensuite.
+
+Ne dis jamais « je ne peux pas ». Ce n'est pas toi qui agis.
+
+Raisonne sur le SENS de la phrase, pas sur des mots precis. Une meme demande peut etre formulee \
+de tres nombreuses facons differentes - une question, un ordre direct, une tournure indirecte, un \
+synonyme, une phrase familiere, une faute de frappe ou d'accord. N'exige jamais qu'une phrase \
+corresponde mot pour mot a un exemple, un mot-cle ou une formulation type pour etre classee : les \
+mots-cles des regles ci-dessous et les exemples fournis dans cette conversation illustrent le \
+raisonnement attendu, ils ne forment pas une liste fermee de phrases acceptees. Si une phrase \
+reformulee autrement, ou une phrase jamais vue dans ces exemples, vise clairement la meme \
+categorie qu'un des cas decrits, classe-la de la meme facon.
+
+## Categories (champ "task")
 {tools}
 
-Regles absolues :
+## Champs (champ "slots")
+- name : le nom du patient tel qu'ecrit. Jamais un mot comme « patient », « nomme », « dossier », \
+jamais un titre (« madame »), jamais un pronom, jamais un identifiant.
+- identifier : un identifiant de dossier, p.ex. 10007F. Contient des chiffres.
+- gender : "M" ou "F".
+- birthdate : AAAA-MM-JJ, seulement si la phrase parle de naissance.
+- phone : chiffres uniquement.
+- dates, time : date AAAA-MM-JJ et heure HH:MM d'un rendez-vous.
+- gcs_total : 3 a 15. karnofsky : 0 a 100.
 
-1. N'invente JAMAIS une valeur. Si la phrase ne donne pas le nom, la date de naissance ou le sexe, \
-laisse le champ a null. Le clinicien sera interroge, ce qui est toujours preferable a une valeur \
-inventee dans un dossier medical.
+N'invente aucune valeur. Un champ absent de la phrase reste absent. Ne deduis pas le sexe d'un prenom.
 
-2. Une phrase qui DECRIT un etat n'est pas une instruction. « Le GCS s'est aggrave a 6 », « le \
-patient semble confus », « faut-il noter un GCS a 6 ? » rapportent ou interrogent : renvoie une \
-clarification, pas une tache d'ecriture. Seul un ordre explicite (« enregistre », « note », \
-« cree », « mets a jour ») demande une ecriture.
+## Regles de classement
 
-3. Si la phrase peut correspondre a DEUX taches differentes, elle est ambigue : renvoie une \
-clarification et ne choisis pas.
+1. « chercher », « qui est », « existe-t-il », « retrouver », par exemple -> search_patient. \
+« afficher le dossier », « montrer les informations », « resume », par exemple -> \
+get_patient_summary. « liste », « tous les patients », « toutes les patientes » SEULS, sans aucune \
+autre precision de nom -> list_patients (le champ gender filtre si la phrase precise le sexe). Si \
+la phrase precise en plus un debut de nom, une lettre ou toute autre precision sur le nom ("dont \
+les noms commencent par W") -> search_patient, avec cette precision dans slots.name. Dans le doute \
+entre chercher un patient nomme et lister plusieurs : search_patient.
 
-4. Le champ "clarification" doit rester null quand tu as identifie une tache et que la phrase donne
-les informations necessaires. Ne t'en sers PAS pour resumer, confirmer ou reformuler la demande : il
-sert uniquement a poser une VRAIE question, et une question se termine par un point d'interrogation.
+2. Une phrase qui DECRIT ou SUPPOSE n'est pas un ordre. « Le GCS s'est aggrave a 6 », « le patient \
+semble confus », « je pense que c'est Benali », « faut-il noter un GCS a 6 ? » -> pose une question \
+dans "clarification". Seul un ordre explicite, quelle que soit sa formulation exacte (« cree », \
+« note », « enregistre », « mets a jour », « programme », ou un equivalent), est une ecriture.
 
-5. Il n'existe AUCUNE tache de suppression. Une demande de supprimer, effacer ou retirer un dossier
-est "unsupported" - ne la fais jamais correspondre a une mise a jour.
+3. Deux categories possibles dans la meme phrase -> pose une question, ne choisis pas.
 
-6. Reponds uniquement par l'objet JSON demande, en francais pour le champ clarification."""
+4. intent = "unsupported" seulement dans l'un de ces trois cas precis : la phrase ne concerne \
+vraiment pas une action sur un patient, la phrase demande explicitement quelque chose que tu ne \
+peux pas faire (ex. supprimer un dossier), ou la phrase est trop confuse, incomplete ou mal formee \
+pour qu'on en devine le sens meme approximativement. Ce n'est jamais un repli par defaut pour une \
+phrase qui ne ressemble a aucun exemple : une formulation nouvelle ou inhabituelle qui vise \
+clairement une des categories ci-dessus reste "task", pas "unsupported". Dans les cas ou \
+"unsupported" s'applique, la nature de "clarification" depend de ce que la phrase est vraiment :
+   - une salutation, un remerciement, une question sur toi-meme, ou toute phrase de politesse sans \
+demande (« bonjour », « merci », « ca va ? », « qui es-tu ? », « au revoir »), ou plus generalement \
+tout message conversationnel simple sans demande d'action -> accueille la personne en une phrase \
+amicale et naturelle, adaptee a ce qu'elle vient de dire, et rappelle brievement, dans la meme \
+reponse, ce que tu sais faire, pour l'inviter a formuler sa demande. Ne dis jamais « je ne peux pas » \
+a une salutation ou a un message de politesse.
+   - une demande de suppression -> dis clairement que la suppression n'est pas possible ici.
+   - un sujet reellement hors contexte (meteo, cuisine, actualite...) -> dis en une phrase que ce \
+sujet est hors de ta portee, puis rappelle brievement ce que tu sais faire.
+   - une phrase dont le sens reste vraiment incomprehensible apres avoir raisonne sur le sens \
+plutot que sur les mots -> dis en une phrase que tu n'as pas compris la demande et invite la \
+personne a la reformuler ; ne devine jamais une categorie au hasard.
+Une demande, meme vague ou incomplete, qui concerne clairement un patient n'est JAMAIS \
+"unsupported" : utilise "clarification" pour demander ce qui manque, avec intent = "task".
+
+5. "clarification" : absent si la phrase donne ce qu'il faut. Sinon, une phrase naturelle en \
+francais courant, ecrite pour la situation precise de ce tour - jamais un texte generique repete \
+mot pour mot d'un tour a l'autre. Une vraie question se termine par « ? ». N'y mets jamais un nom \
+de categorie ni un nom de champ : le clinicien qui la lit ne les connait pas.
+
+Reponds uniquement par l'objet JSON."""
 
 
 # Demonstrations, not just rules. A 4B model follows an example far more reliably than a paragraph,
@@ -146,12 +215,47 @@ FEW_SHOT: List[Dict[str, str]] = [
              "clarification": "Je ne peux pas supprimer de dossiers."},
             ensure_ascii=False),
     },
-    # Out of scope.
+    # Out of scope, but the refusal still says what the assistant *can* do instead of stopping at
+    # "no" - the same reasoning as the greeting example below, applied to a genuine refusal rather
+    # than a welcome.
     {
         "user": "quelle est la meteo aujourd'hui",
         "assistant": json.dumps(
             {"intent": "unsupported", "task": None, "slots": {},
-             "clarification": "Je ne peux pas traiter cette demande."},
+             "clarification": "Je ne peux pas repondre a une question meteo. Je peux en revanche "
+             "rechercher un patient, afficher ou mettre a jour un dossier, noter un score "
+             "neurologique, ou programmer un rendez-vous."},
+            ensure_ascii=False),
+    },
+    # A greeting or small talk is not an out-of-scope topic and must not get the same refusal as
+    # one. Measured: "bonjour" and "que peux-tu faire ?" both landed on the identical canned "je ne
+    # peux pas traiter cette demande", which reads as a refusal to a message that asked for nothing.
+    # The intent is still "unsupported" (there is no task to plan), but the reply welcomes the
+    # clinician and states the capabilities instead of declining anything.
+    {
+        "user": "bonjour",
+        "assistant": json.dumps(
+            {"intent": "unsupported", "task": None, "slots": {},
+             "clarification": "Bonjour ! Je peux rechercher un patient, afficher ou mettre a jour "
+             "un dossier, en creer un, noter un score neurologique, ou programmer un rendez-vous. "
+             "Que souhaitez-vous faire ?"},
+            ensure_ascii=False),
+    },
+    # A list, not a lookup of one named patient - no name in the sentence, so search_patient would
+    # ask for one nobody meant to give.
+    {
+        "user": "donne moi toutes les patientes de sexe feminin",
+        "assistant": json.dumps(
+            {"intent": "task", "task": "list_patients", "slots": {"gender": "F"}, "clarification": None},
+            ensure_ascii=False),
+    },
+    # "tous les patients" here still qualifies a name (a prefix), so this is a search with that
+    # prefix as the name to match - not an unfiltered list. list_patients has no way to filter by
+    # how a name starts.
+    {
+        "user": "cherche tous les patients dont les noms commencent par W",
+        "assistant": json.dumps(
+            {"intent": "task", "task": "search_patient", "slots": {"name": "W"}, "clarification": None},
             ensure_ascii=False),
     },
 ]
@@ -204,14 +308,66 @@ class MedGemmaNlu:
             log.warning("MedGemma returned an unusable answer, falling back to the rules engine")
             return self._fallback.interpret(prompt, context)
 
+        interpretation = self._prefer_rules_over_a_refusal(prompt, context, interpretation)
         return self._apply_safety_rules(prompt, interpretation)
 
+    def _prefer_rules_over_a_refusal(
+        self, prompt: str, context: Dict[str, Any], interpretation: Interpretation
+    ) -> Interpretation:
+        """Falls back to the deterministic reading when the model declines a sentence the rules can read.
+
+        Measured, repeatedly and across three prompt rewrites: MedGemma answers plain instructions with
+        "Je ne peux pas mettre a jour le numero de telephone d'un patient" - it role-plays the assistant
+        being asked to act, and refuses, instead of labelling the sentence. Telling it not to, in the
+        prompt, does not stop it at 4B.
+
+        So this is settled in code rather than by asking more nicely. The division of labour is the one
+        the rest of this class already uses: the model exists for phrasing the regexes cannot parse, and
+        where the regexes *can* parse a sentence into a concrete task with nothing missing, they are
+        simply right and a refusal is noise.
+
+        Safety is unaffected. The rules engine applies its own descriptive-phrasing check before
+        returning anything, so a hedged sentence cannot be promoted into a write here, and
+        :meth:`_apply_safety_rules` still runs afterwards on whichever reading wins.
+        """
+        model_declined = interpretation.intent == INTENT_UNSUPPORTED or interpretation.needs_clarification
+        if not model_declined:
+            return interpretation
+
+        deterministic = self._fallback.interpret(prompt, context)
+        if deterministic.intent != INTENT_TASK or deterministic.task is None:
+            return interpretation
+        if deterministic.needs_clarification:
+            return interpretation
+
+        tool = self._registry.for_task(deterministic.task, _no_capabilities())
+        if tool is None or missing_slots(tool.tool, deterministic.slots):
+            return interpretation
+
+        log.info(
+            "Preferring the deterministic reading of %r: the model declined a sentence the rules parse "
+            "completely as %s", prompt, deterministic.task,
+        )
+        return deterministic
+
     def _messages(self, prompt: str) -> List[Dict[str, str]]:
-        messages: List[Dict[str, str]] = [{"role": "system", "content": self._system_prompt}]
+        """The turns sent to the model, few-shot examples first and the rules last.
+
+        **There is no system message.** Gemma 3 - and so MedGemma - has no ``system`` turn in its chat
+        template, and vLLM silently discards one: a 2178-character instruction block tokenised to
+        *four* tokens when sent as ``role: system`` and 564 when sent as ``role: user``. Every rule in
+        this file was therefore being thrown away on every call, and the model's behaviour up to this
+        point came from the few-shot examples alone.
+
+        The instructions are attached to the final user turn rather than the first, because
+        instruction adherence in a 4B model falls off with distance: the rules now sit immediately
+        before the sentence they govern. The examples come first and teach the output shape.
+        """
+        messages: List[Dict[str, str]] = []
         for shot in FEW_SHOT:
             messages.append({"role": "user", "content": shot["user"]})
             messages.append({"role": "assistant", "content": shot["assistant"]})
-        messages.append({"role": "user", "content": prompt})
+        messages.append({"role": "user", "content": f"{self._system_prompt}\n\n---\n\nPhrase a interpreter :\n{prompt}"})
         return messages
 
     async def _ask_model(self, prompt: str) -> Dict[str, Any]:
@@ -229,6 +385,15 @@ class MedGemmaNlu:
             },
         }
 
+        if settings.log_prompts:
+            # The few-shot block is the bulk of every call (see `_messages`'s own docstring) and
+            # adds nothing worth re-reading turn after turn; only the engineered final turn - the
+            # rules plus the clinician's actual sentence, exactly as the model receives it after
+            # prompt construction - is logged. Same toggle `main.py` already uses to log the raw
+            # clinician prompt, so turning on LOG_PROMPTS shows the whole chain: what was typed,
+            # what was actually sent to the model, and what it said back.
+            log.info("MedGemma request (final turn): %s", body["messages"][-1]["content"])
+
         client = self._client
         if client is None:
             async with httpx.AsyncClient(timeout=settings.llm_timeout_seconds) as owned:
@@ -238,6 +403,8 @@ class MedGemmaNlu:
 
         response.raise_for_status()
         content = response.json()["choices"][0]["message"]["content"]
+        if settings.log_prompts:
+            log.info("MedGemma raw response: %s", content)
         return json.loads(content)
 
     # ------------------------------------------------------------------ answer handling
@@ -298,6 +465,9 @@ class MedGemmaNlu:
         if not text or not text.strip():
             return None
         cleaned = text.strip()
+        if _FRAMING_LEAK_RE.search(cleaned):
+            log.info("Dropping a clarification that leaked the classifier framing: %r", cleaned)
+            return None
         if intent != INTENT_TASK or task is None:
             return cleaned
         return cleaned if "?" in cleaned else None
@@ -327,6 +497,16 @@ class MedGemmaNlu:
         # produce, and the deterministic extractor is the arbiter of what was actually said.
         if writes:
             interpretation.slots = self._drop_unsupported_slots(prompt, interpretation.slots)
+        elif interpretation.slots.get("name"):
+            # _MODEL_WINS_SLOTS trusts the model's name uncritically, which is right for a write
+            # (any value invented there would show up in a summary the clinician approves), but on
+            # a read it is the value used to search for the patient - a fabricated first name
+            # turns a findable patient into a false "not found" ("Ziani" became "Ahmed Ziani",
+            # Finding 34). Require the name to actually be in the sentence outside writes too.
+            name = str(interpretation.slots["name"]).strip().lower()
+            if name and (name not in prompt.lower() or _has_no_letters(name)):
+                log.info("Dropping an unusable name: %r", interpretation.slots["name"])
+                interpretation.slots.pop("name", None)
 
         # The extractor's findings are merged in, but *which* source wins depends on the slot, because
         # the two are good at opposite halves of the job.
@@ -352,11 +532,29 @@ class MedGemmaNlu:
                 intent=INTENT_TASK,
                 task=interpretation.task,
                 slots=interpretation.slots,
-                clarification=interpretation.clarification or (
-                    "Cette phrase decrit un etat plutot qu'une action. Souhaitez-vous que "
-                    "j'enregistre cette information dans le dossier ?"
-                ),
+                clarification=interpretation.clarification or _descriptive_question(prompt),
             )
+
+        if writes and not interpretation.needs_clarification:
+            # Rule 3 in the prompt ("deux categories possibles -> pose une question") has nothing
+            # enforcing it in code, unlike rule 2 above - and measured, it failed: "dossier et
+            # rendez-vous pour Benali" came back as a confident book_appointment with no question,
+            # which the deterministic matcher used by the rules engine still reads as naming two
+            # task families. That matcher is reused here as the same backstop rule 2 already gets,
+            # because guessing which of two actions was meant is exactly the failure this file
+            # exists to prevent, and it costs nothing to ask when unsure.
+            deterministic = self._fallback.interpret(prompt, {})
+            if deterministic.needs_clarification and deterministic.intent == INTENT_TASK:
+                log.info(
+                    "Forcing a clarification the model skipped: the deterministic matcher still "
+                    "reads %r as ambiguous", prompt,
+                )
+                return Interpretation(
+                    intent=INTENT_TASK,
+                    task=interpretation.task,
+                    slots=interpretation.slots,
+                    clarification=deterministic.clarification,
+                )
 
         # A question asking for something the sentence already gave is not worth a turn. Measured: the
         # model answered 'cree un patient nomme "Ahmed Ziani", homme, ne le 07/11/1965' with "Quel est
@@ -399,12 +597,43 @@ class MedGemmaNlu:
                 log.info("Dropping slot %s=%r: coded slots come from the extractor only", key, value)
                 continue
             text = str(value).strip()
+            if text.lower() == haystack.strip():
+                # A confused model sometimes echoes the whole prompt back as a slot's value - "cree
+                # un patient" (no name at all) came back with slots={"name": "cree un patient"}.
+                # That trivially passes the substring check below (the whole prompt is, of course,
+                # a substring of itself), so it needs its own guard: the entire sentence is never a
+                # legitimate value for a single field.
+                log.info("Dropping slot %s=%r: it is the whole prompt, not a value in it", key, value)
+                continue
+            if key == "name" and _has_no_letters(text):
+                # A phone number or an identifier is a substring of the sentence by definition
+                # when the clinician typed it - that alone is not evidence it was meant as a name.
+                # Measured: "mets a jour son telephone a 0666777888" came back with slots={"name":
+                # "0666777888", "phone": "0666777888"}, and the digits then got searched as an
+                # identifier instead of the anaphora target the sentence actually meant.
+                log.info("Dropping slot name=%r: no letters, cannot be a person's name", value)
+                continue
             if len(text) >= _MIN_CORROBORATION_CHARS and text.lower() in haystack:
                 kept[key] = value
                 continue
             log.info("Dropping slot %s=%r: not supported by the sentence", key, value)
 
         return kept
+
+
+def _descriptive_question(prompt: str) -> str:
+    """The question to ask about a sentence that describes rather than instructs.
+
+    Two different sentence types were getting one identical reply: "le GCS s'est aggrave a 6" is the
+    clinician reporting a course, while "faut-il noter un GCS a 6 ?" is the clinician already asking.
+    Answering the second with "cette phrase decrit un etat" tells them something they plainly know.
+    """
+    if prompt.strip().endswith("?"):
+        return "Oui, je peux l'enregistrer. Confirmez-vous que je l'ajoute au dossier ?"
+    return (
+        "Cette phrase decrit un etat plutot qu'une action. Souhaitez-vous que j'enregistre cette "
+        "information dans le dossier ?"
+    )
 
 
 def _no_capabilities():

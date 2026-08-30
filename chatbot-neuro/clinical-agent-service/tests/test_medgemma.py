@@ -348,3 +348,17 @@ async def test_a_structured_slot_still_defers_to_the_extractor(registry):
     result = await nlu.ainterpret('cree un patient nomme "Ahmed Ziani", homme, ne le 07/11/1965', {})
 
     assert result.slots["birthdate"] == "1965-11-07"
+
+
+@pytest.mark.asyncio
+async def test_a_question_and_a_statement_get_different_replies(registry):
+    """Finding 24. Both are correctly refused as writes, but "faut-il noter un GCS a 6 ?" was told
+    "cette phrase decrit un etat" - which the clinician, having just asked a question, already knows."""
+    statement = MedGemmaNlu(registry, client=fake_vllm(answer(task="record_neuro_assessment")))
+    question = MedGemmaNlu(registry, client=fake_vllm(answer(task="record_neuro_assessment")))
+
+    a = await statement.ainterpret("le GCS s'est aggrave a 6", {})
+    b = await question.ainterpret("faut-il noter un GCS a 6 ?", {})
+
+    assert a.needs_clarification and b.needs_clarification
+    assert a.clarification != b.clarification

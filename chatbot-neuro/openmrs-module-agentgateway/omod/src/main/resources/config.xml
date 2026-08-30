@@ -3,7 +3,7 @@
 
     <id>agentgateway</id>
     <name>Clinical Agent Gateway</name>
-    <version>1.1.3</version>
+    <version>1.1.4</version>
     <package>org.openmrs.module.agentgateway</package>
     <author>CERIST / CHU Blida neurosurgery project</author>
     <description>
