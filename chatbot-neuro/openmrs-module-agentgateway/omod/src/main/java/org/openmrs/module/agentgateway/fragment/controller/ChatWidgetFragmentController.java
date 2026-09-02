@@ -3,6 +3,7 @@ package org.openmrs.module.agentgateway.fragment.controller;
 import org.apache.commons.lang.StringUtils;
 import org.openmrs.Patient;
 import org.openmrs.api.context.Context;
+import org.openmrs.module.agentgateway.AgentGatewayConfig;
 import org.openmrs.module.agentgateway.AgentGatewayPrivileges;
 import org.openmrs.ui.framework.fragment.FragmentModel;
 import org.slf4j.Logger;
@@ -37,6 +38,11 @@ public class ChatWidgetFragmentController {
 		model.addAttribute("patientUuid", patient == null ? "" : patient.getUuid());
 		model.addAttribute("canUse", Context.hasPrivilege(AgentGatewayPrivileges.CHAT_USE));
 		model.addAttribute("canWrite", Context.hasPrivilege(AgentGatewayPrivileges.CHAT_WRITE));
+		// Both, not either: the privilege says this clinician may dictate, the configuration says
+		// there is somewhere to dictate to. A microphone button that cannot work is worse than no
+		// microphone button, so it is not rendered at all unless both hold.
+		model.addAttribute("canDictate",
+				Context.hasPrivilege(AgentGatewayPrivileges.VOICE_USE) && AgentGatewayConfig.isDictationConfigured());
 	}
 
 	/**

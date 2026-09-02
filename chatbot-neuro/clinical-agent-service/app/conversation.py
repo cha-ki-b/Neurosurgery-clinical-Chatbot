@@ -9,6 +9,7 @@ and must not become one.
 
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from dataclasses import dataclass, field
@@ -41,6 +42,9 @@ class PendingAction:
     # The user this was summarised for. A pending action is only ever executable by the same
     # clinician who was shown it, even if someone else guesses the conversation id.
     username: str
+    # The read that proves the write landed, built at the same moment as the write itself so it
+    # checks exactly what the clinician approved rather than whatever the frame holds a turn later.
+    verification: Optional[Any] = None
 
 
 @dataclass
@@ -112,6 +116,13 @@ class ConversationState:
     # The request in progress, or None when the assistant is not in the middle of anything.
     frame: Optional[TaskFrame] = None
     updated_at: float = field(default_factory=time.time)
+    # Held for the length of a turn. The store's own lock protects the *dictionary*; it is released
+    # the moment ``get`` returns, and every mutation of the frame happened after that with nothing
+    # holding anything. A turn is not short - it can wait 25 seconds on the model - so two turns on
+    # one conversation had ample room to interleave and leave the frame describing neither of them.
+    # The UI serialises turns today, which is why this had never been seen; a double-submit, a
+    # second tab, or the reconnect-and-retry any future client will have is all it would take.
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
 
     # -- the three legacy fields, now views onto the frame -------------------------------------
     # Kept as properties rather than deleted so nothing that reads them silently sees a stale copy
@@ -130,43 +141,67 @@ class ConversationState:
         return self.frame.awaiting if self.frame else None
 
     def open_frame(self, task: str, slots: Optional[Dict[str, Any]] = None) -> "TaskFrame":
-        """Starts, or switches to, a request - carrying the patient already established.
+        """Starts, or switches to, a request.
 
-        A patient identified for one task is still the patient for the next one in the same
-        breath ("affiche son dossier" then "mets a jour son telephone"), so the frame inherits it
-        rather than asking again.
+        The frame does **not** inherit the last patient. Continuity across turns already works
+        without it: ``_resolve_patient`` falls back to ``last_patient_uuid`` for any task that
+        actually needs a patient, which is what makes "affiche son dossier" work after a search.
+        Copying it onto the frame as well meant a task with no patient at all carried one anyway -
+        a create started after a search told the clinician "patient : Benali Amine" while creating
+        Karim Saidi, which reads as though the two are related. The frame's patient is set by
+        ``remember_patient`` when one is genuinely resolved *for this request*.
         """
         if self.frame is not None and self.frame.task == task:
             if slots:
                 self.frame.slots.update(slots)
             return self.frame
-        self.frame = TaskFrame(
-            task=task,
-            slots=dict(slots or {}),
-            patient_uuid=self.last_patient_uuid,
-            patient_label=self.last_patient_label,
-        )
+        self.frame = TaskFrame(task=task, slots=dict(slots or {}))
         return self.frame
 
     def close_frame(self) -> None:
         self.frame = None
 
     def remember_patient(self, uuid: Optional[str], label: Optional[str] = None) -> None:
+        """Records which patient the conversation is about, and never lets the two disagree.
+
+        The label and the uuid must describe the same person or the summary is a lie. An earlier
+        version kept a known label when a new uuid arrived without one, reasoning that a blank
+        summary is bad. It is - but a *wrong* one is far worse, and that is what it produced: with
+        Cherif's chart open on the dashboard and Benali searched a turn earlier, the confirmation
+        read "Je vais MODIFIER la fiche du patient Benali Amine" and the write landed on Cherif.
+        The clinician approves one record and a different one changes (Finding 57).
+
+        So a uuid that changes clears any label that came with the old one. The caller is expected
+        to supply the right label, or to look it up - which ``_plan_and_maybe_execute`` now does
+        from the record it already reads before an update.
+        """
         if not uuid:
             return
+        changed = uuid != self.last_patient_uuid
         self.last_patient_uuid = uuid
-        # An empty label must never overwrite a known one: the label is what the clinician reads
-        # in a confirmation summary before approving a write.
         if label:
             self.last_patient_label = label
+        elif changed:
+            self.last_patient_label = None
         if self.frame is not None:
             self.frame.patient_uuid = uuid
             if label:
                 self.frame.patient_label = label
+            elif changed:
+                self.frame.patient_label = None
 
 
 class ConversationStore:
-    """In-memory, TTL-bounded, size-bounded, thread-safe."""
+    """In-memory, TTL-bounded, size-bounded, thread-safe.
+
+    Process-local by construction, and deliberately so: this service is not a system of record and
+    a conversation is worth less than the complexity of sharing it. The consequence to know is that
+    it assumes **one replica**. Two instances behind the proxy would each hold half the
+    conversations and a clinician's follow-up would land on whichever one the load balancer chose,
+    losing the frame roughly half the time. Scaling this service out means either sticky sessions
+    keyed on ``conversation_id`` or moving this store to something shared - not adding a second
+    container.
+    """
 
     def __init__(self, ttl_seconds: Optional[int] = None, max_entries: Optional[int] = None) -> None:
         self._ttl = ttl_seconds if ttl_seconds is not None else settings.conversation_ttl_seconds

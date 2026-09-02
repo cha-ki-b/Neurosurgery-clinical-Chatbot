@@ -208,3 +208,125 @@
     color: #777;
     font-style: italic;
 }
+
+/* The waiting indicator. Three dots rather than a spinner: it sits in the message list where a
+   reply will appear, so it should read as "a reply is coming", not as "the page is loading". */
+.agent-message-thinking {
+    display: inline-block;
+    min-width: 3em;
+}
+
+.agent-message-thinking .agent-dot {
+    display: inline-block;
+    width: 0.45em;
+    height: 0.45em;
+    margin-right: 0.25em;
+    border-radius: 50%;
+    background: currentColor;
+    opacity: 0.35;
+    animation: agent-dot-pulse 1.2s infinite ease-in-out;
+}
+
+.agent-message-thinking .agent-dot:nth-child(2) { animation-delay: 0.2s; }
+.agent-message-thinking .agent-dot:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes agent-dot-pulse {
+    0%, 80%, 100% { opacity: 0.25; }
+    40%           { opacity: 0.9; }
+}
+
+/* Respects a clinician who has asked their system to stop animating things. */
+@media (prefers-reduced-motion: reduce) {
+    .agent-message-thinking .agent-dot { animation: none; opacity: 0.6; }
+}
+
+/* --- dictation ------------------------------------------------------------------
+ *
+ * Every class here is agent- prefixed, like the rest of this file: ModuleWiringTest
+ * fails the build otherwise, because an unprefixed class in a module stylesheet
+ * restyles whatever else on the page happens to share the name.
+ */
+
+.agent-voice-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 4px 0 6px 0;
+    min-height: 26px;
+}
+
+.agent-voice-btn {
+    border: 1px solid #ccc;
+    background: #fff;
+    border-radius: 50%;
+    width: 30px;
+    height: 30px;
+    cursor: pointer;
+    color: #555;
+    line-height: 1;
+    padding: 0;
+}
+
+.agent-voice-btn:hover {
+    background: #f2f2f2;
+}
+
+/* An inline SVG, not an icon-font class. `icon-microphone` is absent from some OpenMRS
+ * icon sets and from themed or custom UIs, and the failure is silent: the button renders
+ * as an empty circle with no hint of what it does. currentColor makes the glyph follow
+ * the button, so it turns white when recording turns the button red. */
+.agent-voice-icon {
+    width: 15px;
+    height: 15px;
+    display: block;
+    margin: 0 auto;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+
+.agent-voice-btn[disabled] {
+    opacity: 0.5;
+    cursor: default;
+}
+
+/* With click-to-toggle there is no held button to tell the clinician they are still
+ * recording, so the active state has to be unmistakable - colour and motion, not a
+ * subtle border. */
+.agent-voice-btn.agent-voice-active {
+    background: #c0392b;
+    border-color: #a93226;
+    color: #fff;
+    animation: agent-voice-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes agent-voice-pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(192, 57, 43, 0.55); }
+    70%  { box-shadow: 0 0 0 8px rgba(192, 57, 43, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(192, 57, 43, 0); }
+}
+
+.agent-voice-status {
+    font-size: 0.85em;
+    color: #666;
+}
+
+.agent-voice-status.agent-voice-recording {
+    color: #c0392b;
+}
+
+.agent-voice-status.agent-voice-error {
+    color: #b03a2e;
+}
+
+.agent-voice-undo {
+    border: none;
+    background: none;
+    color: #2c7bb6;
+    text-decoration: underline;
+    cursor: pointer;
+    font-size: 0.8em;
+    padding: 0;
+}

@@ -49,6 +49,35 @@ class PlannedOperation:
 
 
 @dataclass
+class WriteVerification:
+    """One read that proves a write actually landed, and the check that reads its answer.
+
+    Exists because "HTTP 200" is not evidence of a change on this deployment, and that is not a
+    hypothetical: a FHIR PUT replacing an existing telecom or name returns 200 and alters nothing,
+    because fhir2 1.2.2 maps each incoming entry to a *new* object that Hibernate's Set then
+    discards as already-present (see ``_build_update_patient``). The write path was moved to
+    webservices.rest for that reason, but the assistant was still reporting success from a status
+    code alone - so any future regression to a silently-ignoring endpoint would have it telling a
+    clinician their change was saved when it was not.
+
+    ``confirm`` receives the body of ``operation`` and returns a plain-language reason the change
+    is not there, or None if it is.
+    """
+
+    # Given the bodies of the operations already executed, the read that proves the write landed -
+    # or None if there is nothing to check. A callable rather than a fixed operation because a
+    # create does not know the record's uuid until it has been created, exactly as
+    # ``PlannedOperation.body_from_results`` already handles for the write itself.
+    plan: Callable[[List[Any]], Optional["PlannedOperation"]]
+    confirm: Callable[[Any], Optional[str]]
+    # What a mismatch means. An update that did not apply is a failure: nothing happened. A create
+    # whose record exists but holds a different value is *not* a failure - the record is there, and
+    # reporting "echec" would invite a clinician to create it a second time. The two need different
+    # words, and telling them apart is the whole point of naming this.
+    on_mismatch: str = "failed"
+
+
+@dataclass
 class ToolSpec:
     name: str
     task: str
@@ -78,6 +107,10 @@ class ToolSpec:
     expected_privilege: str = ""
     build: Callable[[Dict[str, Any], Dict[str, Any]], List[PlannedOperation]] = None  # type: ignore[assignment]
     summarise: Callable[[Dict[str, Any], Dict[str, Any]], str] = None  # type: ignore[assignment]
+    # Optional. Given the same slots and context the write was built from, returns the read that
+    # proves it landed. A tool with no cheap way to check its own work simply leaves this unset,
+    # and its result is reported from the status code as before.
+    verify: Optional[Callable[[Dict[str, Any], Dict[str, Any]], Optional[WriteVerification]]] = None
 
 
 @dataclass

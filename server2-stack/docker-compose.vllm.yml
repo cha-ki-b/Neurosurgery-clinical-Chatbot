@@ -34,8 +34,21 @@ services:
       # Raising it costs KV cache, and 16 GB is not generous once the weights are resident.
       - --max-model-len
       - "4096"
+      # FP8 on the language model, measured 2026-09-02 (STT/phase2/RESULTS.md).
+      # vLLM's on-the-fly fp8 leaves the SigLIP vision tower and the embeddings in
+      # bf16 - confirmed by the vision probe returning byte-identical output to
+      # bf16, and by the saving being 2.52 GiB rather than the ~3.7 GiB a full
+      # language-model quantisation would give. So no llm-compressor step is needed.
+      # eval_nlu UNSAFE = 0 and explore.py's state distribution both identical to
+      # the bf16 baseline.
+      - --quantization
+      - fp8
+      # Was 0.80 (12500 MiB) at bf16. FP8's non-KV floor is 6.75 GiB, so 0.50 still
+      # leaves 1.44 GiB = 10,768 tokens of KV cache - about 10x the ~1,000 tokens
+      # production actually peaks at. The ~4.2 GB freed is what makes room for the
+      # STT engine (0.25) with headroom left for image workloads.
       - --gpu-memory-utilization
-      - "0.80"
+      - "0.50"
       # One department, one conversation at a time in practice. Headroom goes to stability rather
       # than to throughput nobody is waiting on.
       - --max-num-seqs

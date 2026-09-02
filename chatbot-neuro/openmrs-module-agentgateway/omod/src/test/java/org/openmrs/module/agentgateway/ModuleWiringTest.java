@@ -298,6 +298,105 @@ public class ModuleWiringTest {
 		assertTrue("These CSS classes are not agent- prefixed: " + unprefixed, unprefixed.isEmpty());
 	}
 
+
+	@Test
+	public void everyPrivilegeDescriptionSurvivesOpenmrsValidation() throws Exception {
+		// OpenMRS validates a privilege's description at 250 characters and throws at MODULE
+		// START, not at build time. So an over-long one packages cleanly, deploys cleanly, and
+		// then fails on a running instance with a ValidationException repeated once per retry -
+		// and the privilege is never created, so the feature it gates is invisible with nothing
+		// obviously wrong. That happened on the 1.2.0 deploy and cost a restart cycle.
+		//
+		// Privileges only, deliberately. Both columns are TEXT in the database, so this is a
+		// validator rule rather than a schema one, and it does NOT apply to global properties:
+		// a 355-character sttChannelSecret description was written successfully in the same
+		// deploy that rejected the privilege. Checked against the real database, not assumed.
+		Document config = parse(OMOD.resolve("src/main/resources/config.xml"));
+		List<String> tooLong = new ArrayList<String>();
+
+		NodeList privileges = config.getElementsByTagName("privilege");
+		for (int i = 0; i < privileges.getLength(); i++) {
+			Element privilege = (Element) privileges.item(i);
+			NodeList descriptions = privilege.getElementsByTagName("description");
+			if (descriptions.getLength() == 0) {
+				continue;
+			}
+			String description = descriptions.item(0).getTextContent().trim();
+			if (description.length() > 250) {
+				tooLong.add(privilege.getElementsByTagName("name").item(0).getTextContent().trim()
+						+ " (" + description.length() + " chars)");
+			}
+		}
+		assertTrue("These privilege descriptions exceed OpenMRS's 250-character validation limit and "
+				+ "will fail at module start, leaving the privilege uncreated: " + tooLong, tooLong.isEmpty());
+	}
+
+	// ------------------------------------------------------------------ dictation
+
+	@Test
+	public void dictationNeverSendsAndNeverConfirms() throws Exception {
+		// STT-PLAN.md 6.1, and the reason speech-recognition accuracy is a usability property
+		// here rather than a safety one: the transcript lands in the compose box as a draft the
+		// clinician reads before pressing send, and voice cannot produce the "oui" that
+		// authorises a write. Both rules are one careless line away from being broken by someone
+		// adding a convenience, so the build checks them rather than a comment asking nicely.
+		// Comments are stripped first. The file documents these two rules at length, and naming
+		// the forbidden calls while explaining that they are forbidden is exactly the right thing
+		// for it to do - a check that punished it for that would push the next person to delete
+		// the explanation rather than keep the property.
+		String voice = stripJsComments(read(OMOD.resolve("src/main/webapp/resources/scripts/agent-voice.js")));
+
+		List<String> forbidden = new ArrayList<String>();
+		for (String call : new String[] { "agentSend(", "agentConfirm(", "agentPost(" }) {
+			if (voice.contains(call)) {
+				forbidden.add(call);
+			}
+		}
+		assertTrue("agent-voice.js must never send a turn or confirm a write - it may only put text "
+				+ "in the compose box. Found: " + forbidden, forbidden.isEmpty());
+	}
+
+	/** Removes block and line comments so a check looks at code rather than prose about it. */
+	private static String stripJsComments(String source) {
+		String withoutBlocks = source.replaceAll("(?s)/\\*.*?\\*/", " ");
+		return withoutBlocks.replaceAll("(?m)^\\s*//.*$", " ");
+	}
+
+	@Test
+	public void theDictationRelayGatesItselfOnItsOwnPrivilege() throws Exception {
+		// chat.use is not enough: dictation sends audio to a GPU service, and an administrator
+		// must be able to switch that off without taking the assistant away from anyone.
+		String controller = read(
+				OMOD.resolve("src/main/java/org/openmrs/module/agentgateway/web/controller/TranscribeRelayController.java"));
+		assertTrue("TranscribeRelayController must call requireVoiceUse()",
+				controller.contains("requireVoiceUse()"));
+	}
+
+	@Test
+	public void dictationUsesItsOwnChannelSecretAndAudience() throws Exception {
+		// The dictation service refuses any request presenting the chat's secret, and a chat token
+		// must not be usable to drive the GPU. Reusing either here would quietly remove a boundary
+		// that is tested end-to-end on Server 2 but invisible from inside this module.
+		String constants = read(
+				API.resolve("src/main/java/org/openmrs/module/agentgateway/AgentGatewayConstants.java"));
+		assertTrue("A separate STT channel-secret header must be declared",
+				constants.contains("HEADER_STT_CHANNEL_SECRET"));
+		assertTrue("A separate STT audience must be declared", constants.contains("TOKEN_AUDIENCE_STT"));
+		assertTrue("A separate STT purpose must be declared", constants.contains("PURPOSE_STT"));
+
+		String impl = read(
+				API.resolve("src/main/java/org/openmrs/module/agentgateway/api/impl/AgentGatewayServiceImpl.java"));
+		Matcher mint = Pattern.compile("mintDictationTokenForCurrentUser\\(\\)\\s*\\{(.*?)\\n\\t\\}",
+				Pattern.DOTALL).matcher(impl);
+		assertTrue("mintDictationTokenForCurrentUser must exist", mint.find());
+		String body = mint.group(1);
+		assertTrue("a dictation token must be minted for the STT audience",
+				body.contains("TOKEN_AUDIENCE_STT"));
+		assertTrue("a dictation token must carry purpose=stt", body.contains("PURPOSE_STT"));
+		assertTrue("a dictation token must never carry a write capability - dictation reaches no "
+				+ "OpenMRS API, so there is nothing for one to authorise", body.contains("false"));
+	}
+
 	// ------------------------------------------------------------------ database
 
 	@Test

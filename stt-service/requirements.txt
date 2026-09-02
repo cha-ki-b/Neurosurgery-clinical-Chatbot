@@ -1,0 +1,12 @@
+# Runtime. Four packages: a web framework, a server, an HTTP client, and JWT verification.
+# There is deliberately no audio library, no numpy and no ML dependency - the browser
+# sends 16 kHz mono PCM and the only transformation here is a 44-byte WAV header.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+PyJWT[crypto]==2.10.1
+cryptography==44.0.0
+
+# Tests
+pytest==8.3.4
+pytest-asyncio==0.25.0

@@ -1,4 +1,11 @@
 # Real configuration and key material never belong in the repository.
 .env
+# .env.stt holds the dictation service's own channel secret. A separate file exists
+# precisely so the two services do not share an environment (STT/SECURITY-AUDIT.md
+# finding 1) - which also means a .gitignore matching only ".env" does not cover it.
+.env.stt
+.env.*
+!.env.example
+!.env.stt.example
 certs/
 !certs/.gitkeep

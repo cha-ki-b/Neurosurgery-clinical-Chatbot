@@ -1,5 +1,104 @@
 # Changelog — Clinical Agent Gateway (`agentgateway`)
 
+## 1.2.0 — 2026-09-02
+
+Dictation. The first feature release since 1.1.0; everything between was a fix.
+
+A microphone button in the chat composer. Click to start, click again to stop, and the transcript
+lands in the input box **as an editable draft**. The clinician reads it, corrects anything wrong,
+and presses send themselves.
+
+No schema change. One new privilege, three new settings, one new endpoint. Nothing about the
+existing chat, audit or rollback paths changed — `AgentAuditFilter`, the operation log and the
+confirmation gate are untouched.
+
+### Added
+
+- **`App: agentgateway.voice.use`.** Separate from `chat.use` on purpose: dictation sends audio to
+  a GPU service, and an administrator must be able to switch that off — for a role or hospital-wide
+  — without withdrawing the assistant from anyone. **Assign it, or no microphone appears.**
+- **`agentgateway.sttServiceUrl`**, **`agentgateway.sttChannelSecret`**,
+  **`agentgateway.sttTimeoutMillis`**. The secret must be a *different* value from
+  `agentgateway.channelSecret`; the button stays hidden while it is empty or identical to it, and
+  the dictation service refuses any request presenting the chat's secret.
+- **`POST /module/agentgateway/transcribe.form`** — relays raw 16 kHz mono PCM to the dictation
+  service and returns the transcript. Gated on `voice.use`, bounded at 30 seconds.
+- **`purpose=stt` tokens, minted for audience `stt-service`**, never carrying a write capability.
+  A chat token cannot drive the GPU and a dictation token cannot open a chat turn — the same
+  separation `purpose` already provided between chat, rollback and internal reads, enforced a
+  second time by an audience the recipient checks first. `AgentAuditFilter` still verifies only
+  `clinical-agent-service`, so a dictation token can never authenticate an OpenMRS API call.
+
+### Two safety rules, enforced by the build rather than by comments
+
+`agent-voice.js` **never sends and never confirms**. A new `ModuleWiringTest` case strips comments
+and then fails the build if the file so much as mentions `agentSend(`, `agentPost(` or
+`agentConfirm(` in code. Speech recognition is imperfect and always will be; those two rules are
+what keep that a usability property rather than a safety one, and they are one careless convenience
+away from being lost.
+
+### Fixed during this release, before it shipped
+
+- **A privilege description over 250 characters is rejected at module start, not at build time.**
+  `App: agentgateway.voice.use` packaged cleanly, deployed cleanly, then threw
+  `ValidationException` on every retry and was never created — leaving a feature whose privilege
+  did not exist, with nothing obviously wrong. Now checked by
+  `everyPrivilegeDescriptionSurvivesOpenmrsValidation`.
+  Privileges only: both columns are `TEXT`, so this is a validator rule and it does **not** apply
+  to global properties — a 355-character `sttChannelSecret` description was written successfully in
+  the same deploy that rejected the privilege. Verified against the database, not assumed.
+
+### Deployment
+
+Two steps the module cannot do for itself:
+
+1. **Assign `App: agentgateway.voice.use`** to the roles that should dictate.
+2. **Set `agentgateway.sttChannelSecret`** through **Administration → Settings → Agentgateway**, to
+   the `STT_CHANNEL_SECRET` value from `server2-stack/.env`. Through the UI, not SQL: global
+   properties are cached in memory and a direct `UPDATE` leaves the running instance serving the
+   old value.
+
+And one on the host: **`stt.hospital.lan` must resolve from inside `openmrs-app`.** On this
+deployment the container resolves through the host's `systemd-resolved`, which reads Server 1's
+`/etc/hosts` — which is how `agent.hospital.lan` already works. Add the matching line:
+
+```
+10.0.211.250  stt.hospital.lan
+```
+
+Verify with `docker exec openmrs-app getent hosts stt.hospital.lan`.
+
+## 1.1.5 — 2026-08-31
+
+Chat panel only. No schema change, no new privilege, no API change, no change to the security model.
+
+Given its own version string rather than rebuilt in place, which is the lesson 1.1.4's own entry
+below asks to be applied: a rebuild that changes behaviour and keeps the version is not findable
+afterwards.
+
+### Fixed
+
+- **The chat forgot the conversation on a page reload.** `agentConversationId` was a plain
+  javascript variable, so refreshing the page - or following a link and coming back - silently
+  started a new conversation. Everything the assistant had established went with it: the patient,
+  the field being changed, a half-finished create. The clinician sees the same panel and has no way
+  to know it has forgotten them. The id now lives in `sessionStorage`, whose lifetime matches the
+  agent service's own conversation buffer (`CONVERSATION_TTL_SECONDS`); `localStorage` would have
+  outlived the state it points at and come back referring to nothing. Storage being unavailable
+  (private browsing, locked-down policy) falls back to the previous behaviour rather than erroring.
+
+### Added
+
+- **A waiting indicator while the assistant is thinking.** The input greyed out for up to the
+  model's full timeout with nothing on screen to say why. Three pulsing dots now appear in the
+  message list where the reply will land, and are removed when it arrives.
+
+  Deliberately *not* token streaming. The reply is one short paragraph, and the path is
+  browser -> OpenMRS -> agent, whose middle hop (`HttpJsonClient`) reads the whole body before it
+  returns; streaming would mean rebuilding the Java relay as a chunked proxy for a payload measured
+  in sentences. The silence was the problem, not the absence of tokens. Honours
+  `prefers-reduced-motion`.
+
 ## 1.1.4 (rebuilt) — Phase 22, after the dated 1.1.4 release below
 
 `OperationTarget`'s rollback path parsing fixed; version string intentionally left at 1.1.4 since

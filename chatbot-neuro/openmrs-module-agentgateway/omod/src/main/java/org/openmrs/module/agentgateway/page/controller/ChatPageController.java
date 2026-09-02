@@ -2,6 +2,7 @@ package org.openmrs.module.agentgateway.page.controller;
 
 import org.openmrs.Patient;
 import org.openmrs.api.context.Context;
+import org.openmrs.module.agentgateway.AgentGatewayConfig;
 import org.openmrs.module.agentgateway.AgentGatewayPrivileges;
 import org.openmrs.ui.framework.page.PageModel;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -28,5 +29,8 @@ public class ChatPageController {
 		// Shown in the panel so a clinician knows up front whether the assistant can save
 		// anything for them, instead of finding out only after composing a request.
 		model.addAttribute("canWrite", Context.hasPrivilege(AgentGatewayPrivileges.CHAT_WRITE));
+		// See ChatWidgetFragmentController: privilege AND configuration, never one alone.
+		model.addAttribute("canDictate",
+				Context.hasPrivilege(AgentGatewayPrivileges.VOICE_USE) && AgentGatewayConfig.isDictationConfigured());
 	}
 }

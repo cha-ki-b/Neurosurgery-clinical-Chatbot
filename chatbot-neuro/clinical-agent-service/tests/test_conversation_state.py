@@ -371,3 +371,116 @@ def test_30_the_assistant_never_claims_a_write_the_backend_refused(chat, fateh, 
 
     assert body["state"] == "failed"
     assert "enregistre" not in body["reply"].lower() or "echec" in body["reply"].lower()
+
+
+# ============================================================== 31-33 frame hygiene
+
+
+def test_31_a_new_request_does_not_inherit_an_unrelated_patient(chat, openmrs_server):
+    """A create started after a search told the clinician it held a patient it had nothing to do with."""
+    seed_patient(openmrs_server["app"], "Benali", ["Amine"], "1978-04-03")
+
+    chat.say("cherche le patient Benali")
+    chat.say("cree un patient")
+    chat.say("Karim Saidi")
+    body = chat.say("je te l'ai deja dit")
+
+    assert "Karim Saidi" in body["reply"]
+    assert "Benali" not in body["reply"], "an unrelated patient was carried into the create"
+
+
+def test_32_a_completed_write_closes_the_request(chat, fateh, mock_state):
+    """A finished task must stop absorbing turns, or a stray value plans a second write."""
+    chat.say("mets a jour le telephone de Fateh Mohammed El a 0555123456")
+    chat.say("oui")
+
+    body = chat.say("0666777888")
+
+    assert body["state"] != "awaiting_confirmation", \
+        "a bare number was absorbed into the write that had already completed"
+
+
+def test_33_a_failed_write_keeps_what_was_established(chat, fateh, monkeypatch):
+    """The opposite case: after a failure, correcting one value must not mean retyping everything."""
+    import app.openmrs_client as openmrs_client
+
+    original = openmrs_client.OpenmrsClient.call
+
+    async def refuse_writes(self, method, path, body=None):
+        if method.upper() == "GET":
+            return await original(self, method, path, body)
+        return openmrs_client.ApiResult(status=400, body={"error": {"message": "refused"}})
+
+    monkeypatch.setattr(openmrs_client.OpenmrsClient, "call", refuse_writes)
+
+    chat.say("mets a jour le telephone de Fateh Mohammed El a 0555123456")
+    failed = chat.say("oui")
+    assert failed["state"] == "failed"
+
+    body = chat.say("0666777888")
+    assert body["task_type"] == "update_patient_demographics", "the failed request was thrown away"
+
+
+# ============================================================== 34-36 the patient a write names
+
+
+def test_34_the_open_chart_wins_and_the_summary_names_it(chat, openmrs_server, mock_state):
+    """The worst failure this system can have: approve a change to one patient, change another.
+
+    The dashboard has Cherif open; the conversation searched Benali a turn earlier. The write must
+    land on Cherif *and* the summary must say Cherif. Before this, it said Benali and wrote to
+    Cherif - because the remembered label was not cleared when the remembered uuid changed.
+    """
+    seed_patient(openmrs_server["app"], "Benali", ["Amine"], "1978-04-03", identifier="1000AA")
+    cherif = seed_patient(openmrs_server["app"], "Cherif", ["Fatima"], "1990-01-01", identifier="1000BB")
+
+    chat.say("cherche le patient Benali")
+    body = chat.say("mets a jour son telephone a 0666777888", patient_uuid=cherif)
+
+    assert body["state"] == "awaiting_confirmation"
+    assert "Cherif" in body["reply"], f"the summary named the wrong patient: {body['reply']!r}"
+    assert "Benali" not in body["reply"], f"the summary named a patient it will not change: {body['reply']!r}"
+
+    chat.say("oui")
+    written = [call for call in mock_state["calls"] if call["method"] == "POST"]
+    assert written, "nothing was written"
+    assert all(cherif in call["path"] for call in written), "the write went to the wrong patient"
+
+
+def test_35_a_summary_never_names_a_patient_without_having_read_it(chat, openmrs_server):
+    """With only a uuid and no name available, it must not borrow a name from elsewhere."""
+    cherif = seed_patient(openmrs_server["app"], "Cherif", ["Fatima"], "1990-01-01", identifier="1000BB")
+    seed_patient(openmrs_server["app"], "Benali", ["Amine"], "1978-04-03", identifier="1000AA")
+
+    chat.say("cherche le patient Benali")
+    body = chat.say("mets a jour son telephone a 0666777888", patient_uuid=cherif)
+
+    # Whatever it says, it must not be the other patient's identity.
+    assert "1000AA" not in body["reply"]
+
+
+def test_36_switching_patient_by_name_also_drops_the_old_label(chat, openmrs_server):
+    seed_patient(openmrs_server["app"], "Benali", ["Amine"], "1978-04-03", identifier="1000AA")
+    seed_patient(openmrs_server["app"], "Cherif", ["Fatima"], "1990-01-01", identifier="1000BB")
+
+    chat.say("cherche le patient Benali")
+    body = chat.say("mets a jour le telephone de Cherif a 0666777888")
+
+    assert "Cherif" in body["reply"]
+    assert "Benali" not in body["reply"]
+
+
+def test_37_an_amendment_cannot_move_the_write_to_another_patient(chat, openmrs_server, mock_state):
+    """The amendment path re-plans a pending write. It must revise values, never the target."""
+    benali = seed_patient(openmrs_server["app"], "Benali", ["Amine"], "1978-04-03", identifier="1000AA")
+    seed_patient(openmrs_server["app"], "Cherif", ["Fatima"], "1990-01-01", identifier="1000BB")
+
+    chat.say("mets a jour le telephone de Benali a 0555123456")
+    body = chat.say("en fait mets plutot 0666777888")
+
+    assert body["state"] == "awaiting_confirmation"
+    assert "Benali" in body["reply"], "the amendment moved the write to a different patient"
+
+    chat.say("oui")
+    written = [call for call in mock_state["calls"] if call["method"] == "POST"]
+    assert written and all(benali in call["path"] for call in written)

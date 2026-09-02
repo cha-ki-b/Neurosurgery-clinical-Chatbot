@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional
 
 import jwt
 from cryptography.hazmat.primitives.serialization import load_der_public_key
-from fastapi import FastAPI, Header, Request, Response
+from fastapi import FastAPI, Header, Query, Request, Response
 from fastapi.responses import JSONResponse
 
 from app.openmrs_client import RELAY_PATH_PREFIX
@@ -260,7 +260,16 @@ def build_mock_openmrs(public_key_b64: str) -> FastAPI:
         return CAPABILITY_STATEMENT
 
     @app.get("/ws/fhir2/R4/Patient")
-    async def search_patients(name: str = "", identifier: str = "", gender: str = "") -> Dict[str, Any]:
+    async def search_patients(
+        name: str = "",
+        identifier: str = "",
+        gender: str = "",
+        # FastAPI silently drops a query parameter it does not declare, so an unsupported filter
+        # would have returned the unfiltered list and every test of it would have passed while
+        # proving nothing. Declared here for exactly that reason - the deployed fhir2 advertises
+        # `_lastUpdated` on Patient, so the mock has to honour it or the tests are theatre.
+        _lastUpdated: str = Query(default="", alias="_lastUpdated"),
+    ) -> Dict[str, Any]:
         # Matches on any name part, the way FHIR's `name` search parameter does - "Amine Benali"
         # has to find a patient recorded as family "Benali", given "Amine".
         if identifier:
@@ -287,6 +296,20 @@ def build_mock_openmrs(public_key_b64: str) -> FastAPI:
             matches = list(state["patients"].values())
         if gender:
             matches = [patient for patient in matches if patient.get("gender") == gender]
+        if _lastUpdated:
+            # Only `geYYYY-MM-DD` is understood, which is the only form the assistant sends.
+            # Anything else is refused rather than ignored: a filter the server does not apply, on
+            # a server that answers 200 anyway, is how a wrong count reaches a clinician.
+            if not _lastUpdated.startswith("ge"):
+                return JSONResponse(
+                    {"issue": [{"diagnostics": f"unsupported _lastUpdated prefix: {_lastUpdated}"}]},
+                    status_code=400,
+                )
+            floor = _lastUpdated[2:]
+            matches = [
+                patient for patient in matches
+                if ((patient.get("meta") or {}).get("lastUpdated") or "")[:10] >= floor
+            ]
         return {
             "resourceType": "Bundle",
             "type": "searchset",
@@ -372,7 +395,12 @@ def _label(patient: Dict[str, Any]) -> str:
 
 
 def seed_patient(
-    app: FastAPI, family: str, given: List[str], birth_date: str, identifier: Optional[str] = None
+    app: FastAPI,
+    family: str,
+    given: List[str],
+    birth_date: str,
+    identifier: Optional[str] = None,
+    last_updated: str = "2026-08-01T09:00:00.000+01:00",
 ) -> str:
     patient_id = str(uuid.uuid4())
     record: Dict[str, Any] = {
@@ -381,7 +409,7 @@ def seed_patient(
         "name": [{"use": "official", "family": family, "given": given}],
         "gender": "male",
         "birthDate": birth_date,
-        "meta": {"lastUpdated": "2026-08-01T09:00:00.000+01:00"},
+        "meta": {"lastUpdated": last_updated},
     }
     if identifier:
         record["identifier"] = [{"value": identifier, "use": "official"}]

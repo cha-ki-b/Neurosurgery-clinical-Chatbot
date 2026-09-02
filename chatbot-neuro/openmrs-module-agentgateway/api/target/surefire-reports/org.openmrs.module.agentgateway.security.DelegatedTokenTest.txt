@@ -1,4 +1,4 @@
 -------------------------------------------------------------------------------
 Test set: org.openmrs.module.agentgateway.security.DelegatedTokenTest
 -------------------------------------------------------------------------------
-Tests run: 12, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.238 s -- in org.openmrs.module.agentgateway.security.DelegatedTokenTest
+Tests run: 12, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.220 s -- in org.openmrs.module.agentgateway.security.DelegatedTokenTest

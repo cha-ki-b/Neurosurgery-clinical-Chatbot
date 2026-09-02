@@ -55,7 +55,9 @@ from .nlu.rules import (
     reads_as_deletion,
 )
 from .openmrs_client import ApiResult, OpenmrsClient, OpenmrsUnavailable, explain_failure
+from .phi import safe, safe_path, safe_slots
 from .security import ActingUser
+from .telemetry import telemetry
 from .tools.registry import PlannedOperation, ToolRegistry, ToolSpec, missing_slots
 
 log = logging.getLogger(__name__)
@@ -106,6 +108,19 @@ class Orchestrator:
         context: Dict[str, Any],
     ) -> TurnResult:
         state = store.get(conversation_id, user.username)
+        # One turn at a time per conversation. Everything below reads and writes the frame, and a
+        # second turn arriving mid-flight would otherwise plan from a half-updated one.
+        async with state.lock:
+            return await self._handle_turn_locked(prompt, delegated_token, user, state, context)
+
+    async def _handle_turn_locked(
+        self,
+        prompt: str,
+        delegated_token: str,
+        user: ActingUser,
+        state,
+        context: Dict[str, Any],
+    ) -> TurnResult:
         if context.get("patient_uuid"):
             # The chart the clinician has open. No label comes with it, and none is invented: the
             # label is filled in when the patient is actually read, and until then a summary says
@@ -237,7 +252,7 @@ class Orchestrator:
             )
 
         store.clear_pending(state.conversation_id)
-        return await self._execute(
+        result = await self._execute(
             [
                 PlannedOperation(op.method, op.path, op.body, op.summary, op.body_from_results)
                 for op in pending.operations
@@ -248,7 +263,16 @@ class Orchestrator:
             prompt,
             success_prefix="C'est enregistre.",
             state=state,
+            verification=pending.verification,
         )
+        if result.state == STATE_ANSWERED:
+            # The request is done, so it stops being the request in progress. Left open, a stray
+            # value in the next turn ("0666") would be absorbed into the finished task and planned
+            # as a second write - it would still need confirming, so nothing unsafe, but it is not
+            # what the clinician asked for. A *failed* write keeps its frame, so a correction costs
+            # one turn instead of retyping the whole thing.
+            state.close_frame()
+        return result
 
     def _pending_amendment(self, prompt: str, state, pending) -> Optional[Dict[str, Any]]:
         """The values this turn revises in the write that is waiting, or None.
@@ -364,7 +388,8 @@ class Orchestrator:
             and interpretation.task != frame.task
             and matches_a_task(prompt)
         ):
-            log.info("Switching from %s to %s: %r names a different task", frame.task, interpretation.task, prompt)
+            log.info("Switching from %s to %s: the turn names a different task (%s)",
+                     frame.task, interpretation.task, safe(prompt))
             state.close_frame()
             return interpretation
 
@@ -461,7 +486,8 @@ class Orchestrator:
 
         if filled:
             frame.note_answer()
-            log.info("Frame %s advanced by %r: filled %s", frame.task, prompt, sorted(set(filled)))
+            log.info("Frame %s advanced: filled %s, now holding %s",
+                     frame.task, sorted(set(filled)), safe_slots(frame.slots))
             return Interpretation(intent=INTENT_TASK, task=frame.task, slots=dict(frame.slots))
 
         # --- nothing was filled ---------------------------------------------------------------
@@ -500,6 +526,7 @@ class Orchestrator:
         # was not understood. Repeating it verbatim is what made the assistant feel deaf; saying
         # what is already held, and asking only for what is left, answers the actual complaint.
         if is_repair(prompt) or is_correction(prompt):
+            telemetry.record("frame.repair")
             if frame.note_non_answer() <= MAX_REPAIRS:
                 return Interpretation(
                     intent=INTENT_TASK,
@@ -508,7 +535,10 @@ class Orchestrator:
                     clarification=self._repair_question(frame, tool),
                 )
 
-        log.info("Abandoning %s: %r does not answer the pending question", frame.task, prompt)
+        log.info("Abandoning %s: the turn (%s) does not answer the pending question",
+                 frame.task, safe(prompt))
+        telemetry.record("frame.abandoned")
+        telemetry.record(f"frame.abandoned.{frame.task}")
         state.close_frame()
         return Interpretation(
             intent=INTENT_UNSUPPORTED,
@@ -583,7 +613,14 @@ class Orchestrator:
             )
 
         if tool.requires_patient:
-            resolution = await self._resolve_patient(slots, state, client)
+            # The slot being changed holds the *new* value, never a way to find the patient. Without
+            # this, "modifie le patient X" / "le nom" / "Walter Black" searched OpenMRS for a patient
+            # called Walter Black and reported that no such patient exists - Finding 28's collision
+            # in the opposite direction, and invisible until a rename was tried end to end.
+            patient_slots = dict(slots)
+            if frame.active_field:
+                patient_slots.pop(frame.active_field, None)
+            resolution = await self._resolve_patient(patient_slots, state, client)
             if resolution.get("clarification"):
                 frame.awaiting = resolution.get("awaiting_slot")
                 return TurnResult(reply=resolution["clarification"], state=STATE_AWAITING_CLARIFICATION,
@@ -637,6 +674,15 @@ class Orchestrator:
                 )
             tool_context["current_patient"] = current
 
+            if not tool_context.get("patient_label"):
+                # The patient came from the open chart, which carries a uuid and no name. The
+                # record has just been read, so the name is in hand - and a confirmation summary
+                # for a write must name the person it will change.
+                label = _patient_label(current)
+                if label and label != "(sans nom)":
+                    tool_context["patient_label"] = label
+                    state.remember_patient(tool_context["patient_uuid"], label)
+
             changing = [name for name in tool.updatable_fields if slots.get(name)]
             if not changing:
                 if frame.active_field:
@@ -664,7 +710,8 @@ class Orchestrator:
         if problem is not None:
             slots.pop(problem.slot, None)
             frame.awaiting = problem.slot
-            log.info("Rejecting %s for %s: %s", problem.slot, tool.task, problem.message)
+            log.info("Rejecting slot %s for %s: it failed validation", problem.slot, tool.task)
+            telemetry.record(f"slot.rejected.{problem.slot}")
             return TurnResult(reply=problem.message, state=STATE_AWAITING_CLARIFICATION, task_type=tool.task)
 
         operations = tool.build(dict(slots), tool_context)
@@ -691,6 +738,7 @@ class Orchestrator:
             ],
             task_type=tool.task,
             username=user.username,
+            verification=tool.verify(dict(slots), tool_context) if tool.verify else None,
         )
         state.pending = pending
         # The frame is deliberately *not* closed while a confirmation is outstanding: "en fait,
@@ -800,6 +848,7 @@ class Orchestrator:
         success_prefix: str = "",
         state: Optional[Any] = None,
         slots: Optional[Dict[str, Any]] = None,
+        verification: Optional[Any] = None,
     ) -> TurnResult:
         client = OpenmrsClient(delegated_token, conversation_id, task_type, prompt)
         results: List[ApiResult] = []
@@ -812,7 +861,8 @@ class Orchestrator:
                 # A plan whose later step cannot be built from what the earlier step returned. The
                 # write has not been sent, so say so rather than leaving the clinician guessing
                 # whether something was half-saved.
-                log.warning("Could not build the body for %s %s: %s", operation.method, operation.path, exc)
+                log.warning("Could not build the body for %s %s: %s", operation.method,
+                            safe_path(operation.path), type(exc).__name__)
                 return TurnResult(
                     reply="Echec : la reponse d'OpenMRS n'a pas permis de preparer l'operation suivante. "
                           "Rien n'a ete enregistre.",
@@ -855,10 +905,80 @@ class Orchestrator:
             if len(matches) == 1:
                 state.remember_patient(matches[0].get("id"), _patient_label(matches[0]))
 
+        if verification is not None:
+            outcome = await self._verify_write(verification, client, executed, [r.body for r in results])
+            if outcome is not None:
+                message, verdict = outcome
+                if verdict == STATE_FAILED:
+                    return TurnResult(reply=message, state=STATE_FAILED, task_type=task_type, executed=executed)
+                # A warning rides along with the ordinary success report: what was done, then what
+                # to check about it.
+                reply = _render_results(task_type, results, slots or {})
+                if success_prefix:
+                    reply = f"{success_prefix} {reply}".strip()
+                return TurnResult(reply=f"{reply}\n\n{message}", state=STATE_ANSWERED,
+                                  task_type=task_type, executed=executed)
+
         reply = _render_results(task_type, results, slots or {})
         if success_prefix:
             reply = f"{success_prefix} {reply}".strip()
         return TurnResult(reply=reply, state=STATE_ANSWERED, task_type=task_type, executed=executed)
+
+    async def _verify_write(self, verification, client, executed, bodies) -> Optional[Tuple[str, str]]:
+        """Reads the record back and reports what is actually in it, or None if all is well.
+
+        Three outcomes, and the middle one is the reason this exists at all:
+
+        * the value is there - say nothing, the caller reports success as before;
+        * OpenMRS accepted the write and the value is **not** there - a silent no-op, reported as
+          the failure it is rather than as "c'est enregistre";
+        * the record could not be re-read - the write may well have worked, so this neither claims
+          success nor invents a failure; it says plainly that it could not check.
+        """
+        operation = verification.plan(bodies)
+        if operation is None:
+            # The write returned nothing that identifies a record to re-read. Nothing is claimed
+            # about verification either way.
+            return None
+
+        try:
+            result = await client.call(operation.method, operation.path)
+        except OpenmrsUnavailable:
+            result = None
+
+        if result is None or not result.ok:
+            return (
+                "OpenMRS a accepte la modification, mais je n'ai pas pu relire la fiche pour le "
+                "verifier. Verifiez la valeur dans le dossier avant de vous y fier.",
+                STATE_ANSWERED,
+            )
+
+        executed.append({"method": operation.method, "path": operation.path, "status": result.status})
+
+        reason = verification.confirm(result.body)
+        if reason is None:
+            return None
+
+        if verification.on_mismatch == "warn":
+            # ``reason`` is written for the clinician and names the values - "la date de naissance
+            # enregistree est 2008-09-19, et non 2008-09-20" - so it is patient data and only its
+            # shape goes to the log. The clinician still gets the whole sentence in the reply,
+            # which goes to an authenticated person rather than to a file on this host.
+            log.warning("Write applied but a value differs (%s)", safe(reason))
+            telemetry.record("write.value_differs")
+            return (
+                f"ATTENTION : {reason}. Le dossier existe bien - ne le recreez pas - mais corrigez "
+                "cette valeur dans OpenMRS.",
+                STATE_ANSWERED,
+            )
+
+        log.warning("Write accepted but not applied (%s)", safe(reason))
+        telemetry.record("write.accepted_but_not_applied")
+        return (
+            f"Echec : OpenMRS a accepte la demande mais {reason}. Rien n'a change ; "
+            "signalez-le a l'administrateur plutot que de reessayer.",
+            STATE_FAILED,
+        )
 
 
 # --------------------------------------------------------------------------- rendering
@@ -990,8 +1110,17 @@ def _applied_filter(slots: Dict[str, Any]) -> str:
     filter by creation date, so the honest reply names the filter that *was* applied and lets the
     clinician see it is not the one they meant.
     """
+    applied = []
     if slots.get("gender"):
-        return " (filtre : sexe " + {"M": "masculin", "F": "feminin"}.get(slots["gender"], slots["gender"]) + ")"
+        applied.append("sexe " + {"M": "masculin", "F": "feminin"}.get(slots["gender"], slots["gender"]))
+    if slots.get("since"):
+        # Deliberately "modifies", not "crees". OpenMRS offers no creation-date search parameter,
+        # and answering a question about creation with a count of modifications - silently - is the
+        # failure this whole disclosure exists to prevent.
+        applied.append(f"dossiers modifies depuis le {slots['since']} (OpenMRS ne permet pas de "
+                       "filtrer sur la date de creation)")
+    if applied:
+        return " (filtre : " + ", ".join(applied) + ")"
     return " (aucun filtre : la liste complete)"
 
 

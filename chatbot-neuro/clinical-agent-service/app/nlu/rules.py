@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from datetime import date as _date
+from datetime import date as _date, timedelta as _timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from .base import (
@@ -148,6 +148,10 @@ _TASK_PATTERNS: List[Tuple[str, re.Pattern]] = [
             r"\b(liste[rz]?|list)\b.{0,20}\bpatient"
             r"|\b(tous les patients|toutes les patientes|all patients)\b"
             r"|\bdonne[rz]?[\s-]moi\b.{0,20}\bpatient"
+            # Counting is listing. "combien de patients crees aujourd'hui" matched no family at
+            # all and was answered with "je n'ai pas compris" - the exact phrasing that started
+            # this, and the one a clinician reaches for first.
+            r"|\b(combien de patients?|combien de patientes|how many patients?|nombre de patients?)\b"
         ),
     ),
 ]
@@ -392,6 +396,52 @@ def impossible_dates_in(original: str) -> List[str]:
     return [iso for _, iso, real in _dates_in(original, normalise(original)) if not real]
 
 
+# "Depuis quand" - the half of a date question the assistant could not previously hear at all.
+# Kept narrow on purpose: these are the expressions a clinician actually types, resolved against
+# the clock rather than guessed at, and anything outside them yields nothing rather than a wrong
+# window.
+# The apostrophe is optional *and* may be a space: clinicians type "aujourd'hui", "aujourd hui"
+# and "aujourdhui", and a filter that silently does not apply is worse than one that is refused.
+_SINCE_TODAY_RE = re.compile(r"\b(aujourd\s*'?\s*hui|ce jour|today)\b")
+_SINCE_YESTERDAY_RE = re.compile(r"\b(hier|yesterday)\b")
+_SINCE_WEEK_RE = re.compile(r"\b(cette semaine|this week|de la semaine)\b")
+_SINCE_MONTH_RE = re.compile(r"\b(ce mois([- ]ci)?|this month|du mois)\b")
+_SINCE_NDAYS_RE = re.compile(r"\b(?:les\s+)?(\d{1,3})\s+derniers?\s+jours?\b|\blast\s+(\d{1,3})\s+days?\b")
+_SINCE_EXPLICIT_RE = re.compile(r"\b(depuis|since|a partir du|from)\b")
+
+
+def _extract_since(original: str, text: str) -> Optional[str]:
+    """The start of the window this turn asks about, as an ISO day, or None.
+
+    Resolved here rather than by the model because it depends on today's date, which the model has
+    no reliable access to and would cheerfully invent.
+    """
+    today = _date.today()
+
+    if _SINCE_TODAY_RE.search(text):
+        return today.isoformat()
+    if _SINCE_YESTERDAY_RE.search(text):
+        return (today - _timedelta(days=1)).isoformat()
+    if _SINCE_WEEK_RE.search(text):
+        # The week the clinician is in, from its Monday - not a rolling seven days, which would
+        # answer a different question on a Wednesday.
+        return (today - _timedelta(days=today.weekday())).isoformat()
+    if _SINCE_MONTH_RE.search(text):
+        return today.replace(day=1).isoformat()
+
+    span = _SINCE_NDAYS_RE.search(text)
+    if span:
+        days = int(span.group(1) or span.group(2))
+        return (today - _timedelta(days=days)).isoformat()
+
+    if _SINCE_EXPLICIT_RE.search(text):
+        dates = _extract_dates(original, text)
+        if dates:
+            return dates[0]
+
+    return None
+
+
 def extract_slots(original: str) -> Dict[str, Any]:
     text = normalise(original)
     slots: Dict[str, Any] = {}
@@ -429,6 +479,10 @@ def extract_slots(original: str) -> Dict[str, Any]:
     identifier = _IDENTIFIER_RE.search(original)
     if identifier:
         slots["identifier"] = identifier.group(1)
+
+    since = _extract_since(original, text)
+    if since:
+        slots["since"] = since
 
     gcs = _GCS_RE.search(text)
     if gcs:

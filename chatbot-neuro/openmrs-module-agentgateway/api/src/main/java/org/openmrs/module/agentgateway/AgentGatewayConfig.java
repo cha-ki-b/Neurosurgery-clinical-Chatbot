@@ -48,6 +48,38 @@ public final class AgentGatewayConfig {
 				AgentGatewayConstants.DEFAULT_MAX_LOGGED_BODY_CHARS);
 	}
 
+	// ---------------------------------------------------------------- dictation
+
+	public static String getSttServiceUrl() {
+		return stripTrailingSlash(
+				getString(AgentGatewayConstants.GP_STT_SERVICE_URL, AgentGatewayConstants.DEFAULT_STT_SERVICE_URL));
+	}
+
+	public static String getSttChannelSecret() {
+		return getString(AgentGatewayConstants.GP_STT_CHANNEL_SECRET, "");
+	}
+
+	public static int getSttTimeoutMillis() {
+		return getInt(AgentGatewayConstants.GP_STT_TIMEOUT_MS, AgentGatewayConstants.DEFAULT_STT_TIMEOUT_MS);
+	}
+
+	/**
+	 * Whether dictation is configured well enough to offer at all.
+	 * <p>
+	 * The microphone button is hidden when this is false, rather than shown and then failing: a
+	 * button that does nothing is worse than no button. Deliberately also false when the dictation
+	 * secret matches the agent's - separate secrets are what stop a compromise of the dictation
+	 * service reaching /chat, so a copy-paste of the wrong value disables dictation rather than
+	 * quietly removing that boundary.
+	 */
+	public static boolean isDictationConfigured() {
+		String secret = getSttChannelSecret();
+		if (secret.isEmpty() || getSttServiceUrl().isEmpty()) {
+			return false;
+		}
+		return !secret.equals(getChannelSecret());
+	}
+
 	/**
 	 * The URI prefixes an agent-originated call is allowed to target. A token is only ever a
 	 * delegation of the clinician's privileges over this surface - it is not a general-purpose
