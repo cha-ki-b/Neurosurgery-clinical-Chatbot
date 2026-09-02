@@ -10,7 +10,43 @@
  * this button changes nothing, because the pending action lives in the agent's conversation
  * buffer and is only executed when a confirming turn arrives.
  */
-var agentConversationId = null;
+/*
+ * The conversation id survives a page reload.
+ *
+ * It used to be a plain variable, so refreshing the page - or following a link and coming back -
+ * silently started a new conversation. Everything the assistant had established went with it: the
+ * patient, the field being changed, a half-finished create. The clinician sees the same chat panel
+ * and has no way to know it has forgotten them.
+ *
+ * sessionStorage rather than localStorage on purpose: the id is scoped to this tab and this
+ * browsing session, which is the same lifetime the agent's own conversation buffer has (it expires
+ * after CONVERSATION_TTL_SECONDS). A localStorage id would outlive the state it refers to and come
+ * back pointing at nothing.
+ */
+var AGENT_CONVERSATION_KEY = 'agentgateway.conversationId';
+
+function agentReadConversationId() {
+    try {
+        return window.sessionStorage.getItem(AGENT_CONVERSATION_KEY);
+    } catch (e) {
+        // Private browsing modes and locked-down policies can refuse storage entirely. A
+        // conversation that does not persist is the old behaviour, not a broken page.
+        return null;
+    }
+}
+
+function agentRememberConversationId(id) {
+    if (!id) {
+        return;
+    }
+    try {
+        window.sessionStorage.setItem(AGENT_CONVERSATION_KEY, id);
+    } catch (e) {
+        /* see agentReadConversationId */
+    }
+}
+
+var agentConversationId = agentReadConversationId();
 var agentBusy = false;
 
 /*
@@ -34,10 +70,43 @@ function agentAppend(text, cssClass) {
     messages.scrollTop(messages[0].scrollHeight);
 }
 
+/*
+ * A waiting indicator, not token streaming.
+ *
+ * Streaming was the obvious ask and is the wrong trade here. The reply is one short paragraph, not
+ * an essay, so there is little to stream; and the path is browser -> OpenMRS -> agent, where the
+ * middle hop is HttpJsonClient reading the whole body before it returns. Streaming would mean
+ * reworking the Java relay into a chunked proxy for a payload measured in sentences.
+ *
+ * What actually hurt was the silence: the input greyed out for up to the model's full timeout with
+ * nothing on screen. This says the assistant is working, which is the entire felt difference, in
+ * fifteen lines that cannot break the relay.
+ */
+function agentShowThinking() {
+    if (jQuery('#agentThinking').length) {
+        return;
+    }
+    jQuery('#agentMessages').append(
+        '<div class="agent-message agent-message-bot agent-message-thinking" id="agentThinking">'
+        + '<span class="agent-dot"></span><span class="agent-dot"></span><span class="agent-dot"></span>'
+        + '</div>');
+    var messages = jQuery('#agentMessages');
+    messages.scrollTop(messages[0].scrollHeight);
+}
+
+function agentHideThinking() {
+    jQuery('#agentThinking').remove();
+}
+
 function agentSetBusy(busy) {
     agentBusy = busy;
     jQuery('#agentSendButton').prop('disabled', busy);
     jQuery('#agentInput').prop('disabled', busy);
+    if (busy) {
+        agentShowThinking();
+    } else {
+        agentHideThinking();
+    }
 }
 
 function agentShowPending(pendingAction) {
@@ -76,6 +145,7 @@ function agentPost(message, echo) {
         patientUuid: agentPatientUuid
     }).done(function (response) {
         agentConversationId = response.conversationId || agentConversationId;
+        agentRememberConversationId(agentConversationId);
         agentAppend(response.reply || "L'assistant n'a rien renvoye.", 'agent-message-bot');
         if (response.state === 'awaiting_confirmation') {
             agentShowPending(response.pending_action);

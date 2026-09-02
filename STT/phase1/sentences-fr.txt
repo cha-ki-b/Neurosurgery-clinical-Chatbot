@@ -1,0 +1,50 @@
+Les dix phrases à lire à voix haute — une par enregistrement.
+Lisez-les normalement, à votre rythme habituel. Ne détachez pas les syllabes.
+
+Elles ne sont pas choisies au hasard : ce sont les tâches que l'assistant sait
+déjà faire, et elles contiennent exprès les parties difficiles — noms de
+patients, chiffres, date, identifiant, scores.
+
+  01  Cherche le patient Kaced Amine.
+
+  02  Cherche le patient 10002T.
+
+  03  Montre-moi le dossier de Slimani Slimani et ses derniers passages.
+
+  04  Crée un patient nommé Amine Benali, sexe masculin, né le 3 avril 1978.
+
+  05  Mets à jour son téléphone à 0666777888.
+
+  06  Corrige le nom de la patiente Marry Curry en Marie Curie.
+
+  07  Liste toutes les patientes de sexe féminin.
+
+  08  Le GCS s'est aggravé à 6 depuis ce matin.
+
+  09  Programme un rendez-vous pour lundi prochain à dix heures.
+
+  10  Enregistre un score de Karnofsky à 70 pour ce patient.
+
+
+─────────────────────────────────────────────────────────────────────────────
+Note sur la phrase 08 — c'est un piège volontaire.
+
+Elle DÉCRIT une évolution. Ce n'est pas un ordre d'enregistrer quoi que ce
+soit. Le modèle doit la transcrire telle quelle. S'il la transforme en
+« Enregistre un GCS à 6 », c'est l'échec le plus grave possible : toute la
+sécurité de l'assistant repose sur le fait qu'une phrase descriptive ne
+devienne jamais une écriture.
+─────────────────────────────────────────────────────────────────────────────
+
+Ce qui compte dans chaque phrase, exactement :
+
+      01 → Kaced Amine                    (nom)
+      02 → 10002T                         (identifiant — la lettre finale compte)
+      03 → Slimani Slimani                (nom répété)
+      04 → Amine Benali · 3 avril 1978    (nom + date)
+      05 → 0666777888                     (dix chiffres, tous)
+      06 → Marry Curry → Marie Curie      (les deux orthographes)
+      07 → féminin                        (le filtre)
+      08 → 6  — et le fait que ça reste descriptif
+      09 → lundi prochain · dix heures
+      10 → Karnofsky · 70

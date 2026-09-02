@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from datetime import date as _date, timedelta as _timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from .base import (
@@ -114,6 +115,15 @@ _TASK_PATTERNS: List[Tuple[str, re.Pattern]] = [
         TASK_UPDATE_PATIENT,
         re.compile(
             r"\b(modifie[rz]?|met[s]? a jour|mettre a jour|mise a jour|corrige[rz]?|change[rz]?|update|correct)\b"
+            # A bare "mets"/"set"/"remplace" followed closely by the name of a demographic field.
+            # Without this, "mets son telephone a 0555123456" matched no task family at all and was
+            # answered with "je n'ai pas compris" - a plain instruction the assistant simply had no
+            # pattern for (Finding 41). The field name is required rather than the verb alone, so
+            # "mets un GCS a 6" stays a neurological score and does not become ambiguous between
+            # two families.
+            r"|\b(met[s]?|mettez|mettre|remplace[rz]?|set|put|fix|edit|modify)\b"
+            r"(?:\s+\S+){0,4}?\s+"
+            r"\b(telephone|tel|numero|portable|mobile|nom|prenom|phone|number|name)\b"
         ),
     ),
     (
@@ -138,6 +148,10 @@ _TASK_PATTERNS: List[Tuple[str, re.Pattern]] = [
             r"\b(liste[rz]?|list)\b.{0,20}\bpatient"
             r"|\b(tous les patients|toutes les patientes|all patients)\b"
             r"|\bdonne[rz]?[\s-]moi\b.{0,20}\bpatient"
+            # Counting is listing. "combien de patients crees aujourd'hui" matched no family at
+            # all and was answered with "je n'ai pas compris" - the exact phrasing that started
+            # this, and the one a clinician reaches for first.
+            r"|\b(combien de patients?|combien de patientes|how many patients?|nombre de patients?)\b"
         ),
     ),
 ]
@@ -230,6 +244,14 @@ _NAME_STOPWORDS = {
     "mr", "mme", "mlle", "docteur", "dr",
     # English pronouns: the extractor searched OpenMRS for patients called "he" and "his".
     "he", "his", "him", "she", "her", "hers", "they", "them", "its",
+    # French object pronouns and demonstratives, and the English determiners. Same failure, other
+    # half of the vocabulary: "affiche le dossier pour lui" searched OpenMRS for a patient called
+    # "lui" and reported back that no such patient exists - a false clinical fact assembled out of
+    # a grammatical word (Finding 38). Deliberately excludes name particles that really do appear
+    # in patients' names here ("el", "ben", "ould", "abd").
+    "lui", "eux", "celui", "celle", "ceux", "celles", "leur", "leurs",
+    "ce", "cet", "cette", "ces", "meme", "memes", "moi", "toi", "nous",
+    "it", "this", "that", "these", "those", "the", "their", "my", "your", "our", "same",
     # Politeness that trails a name: "de madame Ziani s'il vous plait" yielded "Ziani s'il".
     "s'il", "sil", "vous", "plait", "please",
 }
@@ -323,18 +345,101 @@ def _trim_to_name(candidate: str) -> Optional[str]:
     return " ".join(kept) if kept else None
 
 
-def _extract_dates(original: str, text: str) -> List[str]:
-    """Every date in the turn, ISO-formatted, in the order they appear."""
-    found: List[Tuple[int, str]] = []
+def _is_a_real_date(iso: str) -> bool:
+    """Whether an ISO string names a day that exists.
+
+    The patterns above read three numbers in the right shape; they cannot tell 20/09/2008 from
+    20-99-2008. Without this, the second became the slot value ``2008-99-20``, survived the
+    confirmation summary a clinician approved, and was refused by OpenMRS's own date parser -
+    the first component in the whole chain that consults a calendar (Finding 37).
+    """
+    try:
+        _date.fromisoformat(iso)
+    except ValueError:
+        return False
+    return True
+
+
+def _dates_in(original: str, text: str) -> List[Tuple[int, str, bool]]:
+    """Every date-shaped token in the turn: (position, ISO form, whether it is a real date)."""
+    found: List[Tuple[int, str, bool]] = []
     for match in _DATE_DMY_RE.finditer(original):
         day, month, year = match.groups()
-        found.append((match.start(), f"{year}-{int(month):02d}-{int(day):02d}"))
+        iso = f"{year}-{int(month):02d}-{int(day):02d}"
+        found.append((match.start(), iso, _is_a_real_date(iso)))
     for match in _DATE_ISO_RE.finditer(original):
-        found.append((match.start(), match.group(0)))
+        found.append((match.start(), match.group(0), _is_a_real_date(match.group(0))))
     for match in _DATE_WORDS_RE.finditer(text):
         day, month_name, year = match.groups()
-        found.append((match.start(), f"{year}-{_MONTHS[month_name]:02d}-{int(day):02d}"))
-    return [value for _, value in sorted(found)]
+        iso = f"{year}-{_MONTHS[month_name]:02d}-{int(day):02d}"
+        found.append((match.start(), iso, _is_a_real_date(iso)))
+    return sorted(found)
+
+
+def _extract_dates(original: str, text: str) -> List[str]:
+    """Every *real* date in the turn, ISO-formatted, in the order they appear.
+
+    An impossible date is not returned at all rather than passed on: a slot that is absent gets a
+    question, and a question is the right answer to "20-99-2008". See :func:`impossible_dates_in`
+    for the phrasing of that question.
+    """
+    return [iso for _, iso, real in _dates_in(original, text) if real]
+
+
+def impossible_dates_in(original: str) -> List[str]:
+    """Date-shaped tokens in the turn that name no real day.
+
+    Kept separate from extraction so the assistant can say *why* it is asking again - "20-99-2008
+    n'est pas une date valide" rather than repeating the original question unchanged, which reads
+    as not having listened.
+    """
+    return [iso for _, iso, real in _dates_in(original, normalise(original)) if not real]
+
+
+# "Depuis quand" - the half of a date question the assistant could not previously hear at all.
+# Kept narrow on purpose: these are the expressions a clinician actually types, resolved against
+# the clock rather than guessed at, and anything outside them yields nothing rather than a wrong
+# window.
+# The apostrophe is optional *and* may be a space: clinicians type "aujourd'hui", "aujourd hui"
+# and "aujourdhui", and a filter that silently does not apply is worse than one that is refused.
+_SINCE_TODAY_RE = re.compile(r"\b(aujourd\s*'?\s*hui|ce jour|today)\b")
+_SINCE_YESTERDAY_RE = re.compile(r"\b(hier|yesterday)\b")
+_SINCE_WEEK_RE = re.compile(r"\b(cette semaine|this week|de la semaine)\b")
+_SINCE_MONTH_RE = re.compile(r"\b(ce mois([- ]ci)?|this month|du mois)\b")
+_SINCE_NDAYS_RE = re.compile(r"\b(?:les\s+)?(\d{1,3})\s+derniers?\s+jours?\b|\blast\s+(\d{1,3})\s+days?\b")
+_SINCE_EXPLICIT_RE = re.compile(r"\b(depuis|since|a partir du|from)\b")
+
+
+def _extract_since(original: str, text: str) -> Optional[str]:
+    """The start of the window this turn asks about, as an ISO day, or None.
+
+    Resolved here rather than by the model because it depends on today's date, which the model has
+    no reliable access to and would cheerfully invent.
+    """
+    today = _date.today()
+
+    if _SINCE_TODAY_RE.search(text):
+        return today.isoformat()
+    if _SINCE_YESTERDAY_RE.search(text):
+        return (today - _timedelta(days=1)).isoformat()
+    if _SINCE_WEEK_RE.search(text):
+        # The week the clinician is in, from its Monday - not a rolling seven days, which would
+        # answer a different question on a Wednesday.
+        return (today - _timedelta(days=today.weekday())).isoformat()
+    if _SINCE_MONTH_RE.search(text):
+        return today.replace(day=1).isoformat()
+
+    span = _SINCE_NDAYS_RE.search(text)
+    if span:
+        days = int(span.group(1) or span.group(2))
+        return (today - _timedelta(days=days)).isoformat()
+
+    if _SINCE_EXPLICIT_RE.search(text):
+        dates = _extract_dates(original, text)
+        if dates:
+            return dates[0]
+
+    return None
 
 
 def extract_slots(original: str) -> Dict[str, Any]:
@@ -374,6 +479,10 @@ def extract_slots(original: str) -> Dict[str, Any]:
     identifier = _IDENTIFIER_RE.search(original)
     if identifier:
         slots["identifier"] = identifier.group(1)
+
+    since = _extract_since(original, text)
+    if since:
+        slots["since"] = since
 
     gcs = _GCS_RE.search(text)
     if gcs:

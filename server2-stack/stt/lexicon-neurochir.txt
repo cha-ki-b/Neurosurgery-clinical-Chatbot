@@ -1,0 +1,82 @@
+# Vocabulary biasing for dictation — neurosurgery, CHU Blida.
+#
+# Free-form context passed to the ASR engine on every request to steer decoding toward
+# the words this department actually uses. Read fresh each call, so editing this file
+# takes effect immediately — no restart, no rebuild.
+#
+# This is what replaces fine-tuning (STT-PLAN.md §3/Q3). A small fine-tune on a few hours
+# of audio buys vocabulary at the cost of acoustic robustness; this buys the vocabulary
+# for free and is changed by editing a text file.
+#
+# One term per line. Lines starting with # are ignored, as are blank lines.
+#
+# The highest-value entry here is not in this file at all: the names of patients
+# currently on the ward. In this system the transcript's job is to name a patient, a
+# number and a verb, so biasing on the current inpatient list is worth more than any
+# amount of general medical vocabulary. Feeding it in per request is a later change to
+# the OpenMRS relay — noted in the plan, not built yet.
+
+# --- scores and scales
+Glasgow
+score de Glasgow
+GCS
+Karnofsky
+Rankin
+ASIA
+
+# --- conditions
+hydrocéphalie
+méningiome
+glioblastome
+astrocytome
+hématome sous-dural
+hématome extradural
+hémorragie méningée
+anévrisme
+malformation artério-veineuse
+hernie discale
+canal lombaire étroit
+spondylolisthésis
+traumatisme crânien
+engagement cérébral
+œdème cérébral
+
+# --- procedures
+craniotomie
+crâniectomie
+dérivation ventriculo-péritonéale
+dérivation ventriculaire externe
+laminectomie
+arthrodèse
+discectomie
+embolisation
+stéréotaxie
+volet décompressif
+
+# --- anatomy
+frontal
+pariétal
+temporal
+occipital
+cervelet
+tronc cérébral
+ventricule
+dure-mère
+moelle épinière
+cauda equina
+
+# --- imaging
+scanner cérébral
+IRM cérébrale
+angioscanner
+angio-IRM
+séquence FLAIR
+diffusion
+injection de produit de contraste
+
+# --- ward vocabulary
+compte rendu opératoire
+consultation post-opératoire
+bloc opératoire
+réanimation
+sortie contre avis médical

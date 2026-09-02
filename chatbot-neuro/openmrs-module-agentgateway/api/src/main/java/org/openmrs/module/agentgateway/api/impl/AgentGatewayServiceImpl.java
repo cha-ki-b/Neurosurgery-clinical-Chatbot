@@ -46,6 +46,20 @@ public class AgentGatewayServiceImpl extends BaseOpenmrsService implements Agent
 	}
 
 	@Override
+	public String mintDictationTokenForCurrentUser() {
+		AgentGatewayPrivileges.requireVoiceUse();
+
+		User user = Context.getAuthenticatedUser();
+		if (user == null) {
+			throw new IllegalStateException("A dictation token can only be minted for an authenticated user");
+		}
+		// mayWrite is false unconditionally, and there is no branch that could make it true.
+		// Dictation returns text to the clinician's compose box; it reaches no OpenMRS API.
+		return DelegatedTokenService.mintForAudience(DelegatedTokenService.subjectFor(user), user.getUuid(), null, false,
+				AgentGatewayConstants.PURPOSE_STT, AgentGatewayConstants.TOKEN_AUDIENCE_STT);
+	}
+
+	@Override
 	public DelegatedToken verifyDelegatedToken(String token) {
 		return DelegatedTokenService.verify(token);
 	}

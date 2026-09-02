@@ -52,6 +52,22 @@ public final class AgentGatewayConstants {
 	/** Maximum number of characters of any single request/response body kept in the log. */
 	public static final String GP_MAX_LOGGED_BODY_CHARS = "agentgateway.maxLoggedBodyChars";
 
+	// ---------------------------------------------------------------- dictation
+
+	/** Base URL of the Clinical Dictation Service on Server 2, e.g. https://stt.hospital.lan */
+	public static final String GP_STT_SERVICE_URL = "agentgateway.sttServiceUrl";
+
+	/**
+	 * Shared secret proving a relayed dictation genuinely came from this OpenMRS instance.
+	 * <p>
+	 * Must be a <em>different</em> value from {@link #GP_CHANNEL_SECRET}. The dictation service
+	 * refuses to start if the two match, and refuses any request presenting the agent's secret.
+	 */
+	public static final String GP_STT_CHANNEL_SECRET = "agentgateway.sttChannelSecret";
+
+	/** Connect/read timeout in milliseconds for the relay call to the dictation service. */
+	public static final String GP_STT_TIMEOUT_MS = "agentgateway.sttTimeoutMillis";
+
 	// ---------------------------------------------------------------- defaults
 
 	public static final String DEFAULT_AGENT_SERVICE_URL = "http://localhost:8000";
@@ -65,6 +81,22 @@ public final class AgentGatewayConstants {
 	public static final String DEFAULT_SELF_BASE_URL = "http://localhost:8080/openmrs";
 
 	public static final int DEFAULT_MAX_LOGGED_BODY_CHARS = 20000;
+
+	public static final String DEFAULT_STT_SERVICE_URL = "https://stt.hospital.lan";
+
+	/**
+	 * 20 seconds. A 30-second utterance transcribes in well under one second on the deployed
+	 * hardware (measured: 17 s of audio in 0.23 s), so this is a stuck-connection backstop rather
+	 * than a working bound. Must stay below the proxy's own read timeout.
+	 */
+	public static final int DEFAULT_STT_TIMEOUT_MS = 20000;
+
+	/**
+	 * Hard ceiling on a relayed dictation, in bytes: 30 seconds of 16 kHz mono 16-bit PCM.
+	 * The dictation service enforces the same limit and answers 413; this stops an oversized body
+	 * being buffered inside Tomcat before it ever leaves Server 1.
+	 */
+	public static final int MAX_DICTATION_BYTES = 16000 * 30 * 2;
 
 	/**
 	 * Prefix the agent puts in front of the real path it wants to reach, e.g.
@@ -108,6 +140,12 @@ public final class AgentGatewayConstants {
 	/** Channel secret header on the OpenMRS -> agent leg and on the public-key endpoint. */
 	public static final String HEADER_CHANNEL_SECRET = "X-Agent-Channel-Key";
 
+	/**
+	 * The dictation service's own channel header. A different header carrying a different secret:
+	 * presenting the chat's key here is refused, and presenting this one at /chat is refused too.
+	 */
+	public static final String HEADER_STT_CHANNEL_SECRET = "X-Stt-Channel-Key";
+
 	/** On a reversing call, the id of the logged operation being reversed. */
 	public static final String HEADER_REVERSES_LOG_ID = "X-OpenMRS-Agent-Reverses";
 
@@ -146,6 +184,24 @@ public final class AgentGatewayConstants {
 
 	/** Reading a resource's state back before an agent write overwrites it. Read-only by design. */
 	public static final String PURPOSE_INTERNAL_READ = "internal_read";
+
+	/**
+	 * One dictation being transcribed. Carries no write capability and reaches no OpenMRS API:
+	 * the dictation service turns audio into text and hands it back. It exists so the service can
+	 * rate-limit per clinician - every request arrives from this server's single address, so the
+	 * proxy's limit bounds the hospital rather than a user - and so a dictation can be attributed.
+	 */
+	public static final String PURPOSE_STT = "stt";
+
+	/**
+	 * The dictation service's audience, deliberately not {@link #TOKEN_AUDIENCE}.
+	 * <p>
+	 * A chat token must not be usable to drive the GPU, and a dictation token must not open a chat
+	 * turn. The two services also hold different channel secrets, for the same reason: the
+	 * dictation service decodes attacker-shaped binary audio through a model runtime, which is a
+	 * larger attack surface than the agent's JSON, and a compromise there must not reach /chat.
+	 */
+	public static final String TOKEN_AUDIENCE_STT = "stt-service";
 
 	private AgentGatewayConstants() {
 	}

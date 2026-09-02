@@ -18,6 +18,7 @@ from urllib.parse import quote
 import httpx
 
 from .config import settings
+from .phi import safe_path
 
 log = logging.getLogger(__name__)
 
@@ -167,7 +168,11 @@ class OpenmrsClient:
             ) as client:
                 response = await client.request(method, url, headers=self._headers(), json=body)
         except httpx.HTTPError as exc:
-            log.warning("OpenMRS could not be reached for %s %s: %s", method, path, exc)
+            # The path is redacted and the exception is reduced to its type: httpx embeds the full
+            # URL in several of its error strings, so ``%s`` on the exception leaks the query the
+            # redaction just removed.
+            log.warning("OpenMRS could not be reached for %s %s: %s", method, safe_path(path),
+                        type(exc).__name__)
             raise OpenmrsUnavailable(str(exc)) from exc
 
         try:
@@ -176,7 +181,7 @@ class OpenmrsClient:
             parsed = response.text
 
         if not (200 <= response.status_code < 300):
-            log.info("OpenMRS refused %s %s with HTTP %s", method, path, response.status_code)
+            log.info("OpenMRS refused %s %s with HTTP %s", method, safe_path(path), response.status_code)
         return ApiResult(status=response.status_code, body=parsed)
 
 

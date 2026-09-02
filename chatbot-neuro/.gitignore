@@ -1,0 +1,28 @@
+# Build output. Maven's target/ holds the .omod and its jars, which are rebuilt from
+# source by anyone who needs them - and a stale committed .omod is worse than none,
+# because it looks deployable.
+target/
+*.omod
+*.jar
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Local configuration and anything derived from it. The agent service reads its
+# settings from server2-stack/.env, which is not in the repository either.
+.env
+.env.*
+!.env.example
+
+# Timestamped copies made before edits. They routinely contain live configuration,
+# and CLAUDE.md's backup convention deliberately keeps them out of the source tree
+# for a second reason: anything under omod/src/main/webapp/ is packaged INTO the
+# .omod, so a backup left there ships to the server.
+agent-backups/
+module-backups/
+*.bak
+*.bak-*

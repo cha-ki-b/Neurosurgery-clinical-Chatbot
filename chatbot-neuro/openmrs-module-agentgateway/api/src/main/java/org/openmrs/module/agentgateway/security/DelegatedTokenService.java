@@ -113,17 +113,41 @@ public final class DelegatedTokenService {
 				AgentGatewayConfig.getTokenTtlSeconds(), getPrivateKey(), System.currentTimeMillis() / 1000L);
 	}
 
+	/**
+	 * Mints for a named audience rather than the clinical agent's.
+	 * <p>
+	 * Added for the dictation service, which verifies {@code aud = stt-service}. Keeping the
+	 * audiences apart is what stops a chat token driving the GPU and a dictation token opening a
+	 * chat turn - the same separation {@code purpose} already provides, enforced a second time by
+	 * a claim the recipient checks before it looks at anything else.
+	 */
+	public static String mintForAudience(String username, String userUuid, String conversationId, boolean mayWrite,
+			String purpose, String audience) {
+		return mintWith(username, userUuid, conversationId, mayWrite, purpose,
+				AgentGatewayConfig.getTokenTtlSeconds(), getPrivateKey(), System.currentTimeMillis() / 1000L,
+				audience);
+	}
+
 	public static String mintWith(String username, String userUuid, String conversationId, boolean mayWrite,
 			String purpose, int ttlSeconds, PrivateKey privateKey, long nowEpochSeconds) {
+		return mintWith(username, userUuid, conversationId, mayWrite, purpose, ttlSeconds, privateKey,
+				nowEpochSeconds, AgentGatewayConstants.TOKEN_AUDIENCE);
+	}
+
+	public static String mintWith(String username, String userUuid, String conversationId, boolean mayWrite,
+			String purpose, int ttlSeconds, PrivateKey privateKey, long nowEpochSeconds, String audience) {
 		if (StringUtils.isBlank(username)) {
 			throw new TokenException("Cannot mint a delegated token without a username");
 		}
 		if (StringUtils.isBlank(purpose)) {
 			throw new TokenException("Cannot mint a delegated token without a purpose");
 		}
+		if (StringUtils.isBlank(audience)) {
+			throw new TokenException("Cannot mint a delegated token without an audience");
+		}
 		Map<String, Object> claims = new LinkedHashMap<String, Object>();
 		claims.put("iss", AgentGatewayConstants.TOKEN_ISSUER);
-		claims.put("aud", AgentGatewayConstants.TOKEN_AUDIENCE);
+		claims.put("aud", audience);
 		claims.put("sub", username);
 		claims.put("iat", nowEpochSeconds);
 		claims.put("exp", nowEpochSeconds + Math.max(30, ttlSeconds));

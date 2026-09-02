@@ -32,6 +32,17 @@ public interface AgentGatewayService extends OpenmrsService {
 	String mintDelegatedTokenForCurrentUser(String conversationId);
 
 	/**
+	 * Mints a short-lived token naming the current user for the dictation service.
+	 * <p>
+	 * Deliberately different from {@link #mintDelegatedTokenForCurrentUser} in three ways: a
+	 * different audience, a different purpose, and {@code may_write} always false. Dictation turns
+	 * audio into text and touches no OpenMRS API, so there is nothing for a write capability to
+	 * authorise - and a token that cannot write is one less thing to worry about if it leaks.
+	 */
+	@Authorized({ AgentGatewayPrivileges.VOICE_USE })
+	String mintDictationTokenForCurrentUser();
+
+	/**
 	 * @throws org.openmrs.module.agentgateway.security.TokenException if the token is missing,
 	 *             malformed, unsigned by this instance, expired, or for another audience
 	 */

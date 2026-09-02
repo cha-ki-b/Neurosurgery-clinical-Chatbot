@@ -22,11 +22,17 @@ and the numbers below should be re-read as provisional until they do.
 from __future__ import annotations
 
 import asyncio
+import pathlib
 import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-sys.path.insert(0, "/srv/agent")
+# The service's own directory, worked out from this file rather than hardcoded. It used to be the
+# literal "/srv/agent", which is where the code lives *inside the built image* - so running this
+# against a checkout mounted anywhere else silently measured the image's baked-in copy instead of
+# the code under test, and reported it as a clean result. Two rounds of "no regression" were
+# measured that way before the hardcoded path was noticed (Finding 46).
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from app.nlu.base import (  # noqa: E402
     TASK_BOOK_APPOINTMENT,

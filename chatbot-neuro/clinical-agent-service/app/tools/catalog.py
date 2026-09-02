@@ -14,7 +14,7 @@ words, before anything is sent - that summary *is* the confirmation gate (CA5, A
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from ..nlu.base import (
     TASK_BOOK_APPOINTMENT,
@@ -26,7 +26,7 @@ from ..nlu.base import (
     TASK_UPDATE_PATIENT,
 )
 from ..nlu.rules import identifier_shaped
-from .registry import PlannedOperation, ToolRegistry, ToolSpec
+from .registry import PlannedOperation, ToolRegistry, ToolSpec, WriteVerification
 
 # Creating a patient in OpenMRS needs an identifier of a type the installation knows about.
 # Configured rather than guessed: identifier types are a per-deployment decision.
@@ -149,9 +149,25 @@ def _build_search_patient(slots: Dict[str, Any], context: Dict[str, Any]) -> Lis
 
 
 def _build_list_patients(slots: Dict[str, Any], context: Dict[str, Any]) -> List[PlannedOperation]:
-    query = f"gender={_gender(slots['gender'])}" if slots.get("gender") else ""
-    path = "/ws/fhir2/R4/Patient?_count=50" + (f"&{query}" if query else "")
+    """Lists patients, optionally narrowed by sex and by when the record was last touched.
+
+    The date parameter is `_lastUpdated`, and that is not the same thing as "created" - it moves
+    every time anyone edits the record. It is what the deployed fhir2 actually offers (its
+    CapabilityStatement advertises `_lastUpdated` and `birthdate` on Patient, and nothing about a
+    creation date), so it is what the assistant filters on, and the reply says so in those words
+    rather than answering a question about creation with an answer about modification.
+    """
+    filters = []
+    if slots.get("gender"):
+        filters.append(f"gender={_gender(slots['gender'])}")
+    if slots.get("since"):
+        filters.append(f"_lastUpdated=ge{slots['since']}")
+
+    path = "/ws/fhir2/R4/Patient?_count=50" + ("&" + "&".join(filters) if filters else "")
+
     label = f" de sexe {_readable_gender(slots['gender'])}" if slots.get("gender") else ""
+    if slots.get("since"):
+        label += f" modifies depuis le {slots['since']}"
     return [PlannedOperation(method="GET", path=path, summary=f"Lister les patients{label}")]
 
 
@@ -346,16 +362,117 @@ def _build_update_patient(slots: Dict[str, Any], context: Dict[str, Any]) -> Lis
 
 
 def _summarise_update_patient(slots: Dict[str, Any], context: Dict[str, Any]) -> str:
+    """The summary a clinician approves before a record is changed.
+
+    It names the patient unconditionally. Measured: when the patient came from the open chart or
+    from an earlier turn rather than from this sentence, ``patient_label`` was the empty string and
+    the summary read "Je vais MODIFIER la fiche du patient  :" - a write approved without the
+    clinician being told whose record it lands in. The label is now carried on the frame, and this
+    falls back to the uuid rather than to nothing, because an opaque identifier is still something
+    that can be checked and a blank is not.
+    """
     changes = []
     if slots.get("phone"):
         changes.append(f"  - Telephone : {slots['phone']}")
     if slots.get("name"):
         changes.append(f"  - Nom : {slots['name']}")
+    who = context.get("patient_label") or context.get("patient_uuid") or "(patient non identifie)"
     return "\n".join(
-        ["Je vais MODIFIER la fiche du patient " + context.get("patient_label", "") + " :"]
+        [f"Je vais MODIFIER la fiche du patient {who} :"]
         + changes
         + ["Les autres champs resteront inchanges. Confirmez-vous la modification ?"]
     )
+
+
+def _digits(value: Any) -> str:
+    return "".join(char for char in str(value) if char.isdigit())
+
+
+def _verify_update_patient(slots: Dict[str, Any], context: Dict[str, Any]) -> Optional[WriteVerification]:
+    """Re-reads the patient and checks the value the clinician asked for is actually there.
+
+    The one thing this must not do is re-read through the same route that did the writing. It
+    reads FHIR, which is a different code path in OpenMRS from the webservices.rest sub-resource
+    the write went to - so a write that was accepted and silently dropped shows up as a value that
+    did not change, rather than as an echo of what was just sent.
+    """
+    expected = {field: slots[field] for field in ("phone", "name") if slots.get(field)}
+    if not expected:
+        return None
+
+    def confirm(body: Any) -> Optional[str]:
+        if not isinstance(body, dict):
+            return "la fiche relue n'etait pas exploitable"
+
+        if "phone" in expected:
+            wanted = _digits(expected["phone"])
+            found = [_digits(entry.get("value")) for entry in (body.get("telecom") or [])]
+            if wanted not in found:
+                return "le numero de telephone est inchange dans le dossier"
+
+        if "name" in expected:
+            wanted = {part.lower() for part in str(expected["name"]).split() if part}
+            names = body.get("name") or []
+            actual = set()
+            for entry in names:
+                actual.update(part.lower() for part in (entry.get("given") or []))
+                if entry.get("family"):
+                    actual.add(str(entry["family"]).lower())
+            if not wanted <= actual:
+                return "le nom est inchange dans le dossier"
+
+        return None
+
+    operation = PlannedOperation(
+        method="GET",
+        path=f"/ws/fhir2/R4/Patient/{context['patient_uuid']}",
+        summary="Relire la fiche pour verifier que la modification a bien ete enregistree",
+    )
+    return WriteVerification(plan=lambda _results: operation, confirm=confirm)
+
+
+def _verify_create_patient(slots: Dict[str, Any], context: Dict[str, Any]) -> Optional[WriteVerification]:
+    """Re-reads the record just created and checks it holds what the clinician approved.
+
+    Not a hypothetical concern on this deployment. The OpenMRS global property
+    `timezone.conversions` is false (Finding 36), so every date the REST layer serialises goes out
+    as a naive local timestamp with no offset - and a patient created with a birthdate of
+    2008-09-20 was observed listed afterwards as 2008-09-19. A date of birth silently off by a day
+    is the kind of error nobody catches by reading a success message, and it is in the record for
+    good.
+
+    The mismatch is reported as a warning rather than a failure on purpose: the patient really was
+    created, and a clinician told "echec" would reasonably create them a second time.
+    """
+    expected_birthdate = slots.get("birthdate")
+    expected_name = slots.get("name")
+    if not expected_birthdate and not expected_name:
+        return None
+
+    def plan(results: List[Any]) -> Optional[PlannedOperation]:
+        created = results[-1] if results else None
+        uuid = created.get("uuid") if isinstance(created, dict) else None
+        if not uuid:
+            # Nothing to read back. The create is reported from its own response, as before.
+            return None
+        return PlannedOperation(
+            method="GET",
+            path=f"/ws/fhir2/R4/Patient/{uuid}",
+            summary="Relire le dossier cree pour verifier les valeurs enregistrees",
+        )
+
+    def confirm(body: Any) -> Optional[str]:
+        if not isinstance(body, dict):
+            return None
+        stored = body.get("birthDate")
+        if expected_birthdate and stored and stored != expected_birthdate:
+            return (
+                f"la date de naissance enregistree est {stored}, et non {expected_birthdate} "
+                "comme demande"
+            )
+        return None
+
+    return WriteVerification(plan=plan, confirm=confirm, on_mismatch="warn")
 
 
 def _build_book_appointment(slots: Dict[str, Any], context: Dict[str, Any]) -> List[PlannedOperation]:
@@ -490,6 +607,7 @@ TOOLS = [
         expected_privilege="Add Patients",
         build=_build_create_patient,
         summarise=_summarise_create_patient,
+        verify=_verify_create_patient,
     ),
     ToolSpec(
         name="update_patient_demographics",
@@ -497,6 +615,14 @@ TOOLS = [
         writes=True,
         description="Mettre a jour les informations administratives d'un patient",
         requires_patient=True,
+        # The two fields _build_update_patient can actually write. Everything the assistant offers
+        # to change, accepts as an answer to "what should I change?", and resolves "it" against
+        # comes from this one tuple.
+        updatable_fields=("phone", "name"),
+        slot_questions={
+            "phone": "Quel est le nouveau numero de telephone ?",
+            "name": "Quel est le nouveau nom du patient ?",
+        },
         # No fhir_resource: targets webservices.rest, not FHIR (see the note on _build_update_patient
         # - a FHIR PUT cannot actually change an existing telecom or name value on this deployment).
         # Availability therefore is not read from the FHIR capability statement, matching
@@ -506,6 +632,7 @@ TOOLS = [
         expected_privilege="Edit Patients",
         build=_build_update_patient,
         summarise=_summarise_update_patient,
+        verify=_verify_update_patient,
     ),
     ToolSpec(
         name="book_appointment",

@@ -362,3 +362,96 @@ async def test_a_question_and_a_statement_get_different_replies(registry):
 
     assert a.needs_clarification and b.needs_clarification
     assert a.clarification != b.clarification
+
+
+# --------------------------------------------------------------------------- transient failures
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_response_is_retried_once_before_giving_up(registry):
+    """Measured live: one sentence in twenty-eight came back as `Expecting ',' delimiter`."""
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return httpx.Response(200, json={"choices": [{"message": {"content": '{"intent": "task", '}}]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(
+            {"intent": "task", "task": "search_patient", "slots": {"name": "walter white"},
+             "clarification": None})}}]})
+
+    engine = MedGemmaNlu(registry, client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    result = await engine.ainterpret("cherche le patient walter white", {})
+
+    assert attempts["n"] == 2, "the damaged response was not retried"
+    assert result.task == "search_patient"
+
+
+@pytest.mark.asyncio
+async def test_a_timeout_is_not_retried(registry):
+    """Twenty-five seconds is the budget. Spending fifty to reach the same fallback is worse."""
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        raise httpx.ReadTimeout("too slow", request=request)
+
+    engine = MedGemmaNlu(registry, client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    result = await engine.ainterpret("cherche le patient walter white", {})
+
+    assert attempts["n"] == 1, "a timeout was retried, doubling the clinician's wait"
+    assert result.task == "search_patient", "the rules fallback did not take over"
+
+
+@pytest.mark.asyncio
+async def test_a_second_failure_still_falls_back_rather_than_raising(registry):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"message": {"content": "not json at all"}}]})
+
+    engine = MedGemmaNlu(registry, client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    result = await engine.ainterpret("cherche le patient walter white", {})
+
+    assert result.task == "search_patient"
+
+
+@pytest.mark.asyncio
+async def test_an_answer_cut_off_for_length_is_retried_with_more_room(registry):
+    """`finish_reason=length` means the answer ran out of budget, not that the model is confused.
+
+    Measured live: two cases in twenty-eight hit a 512-token cap at 573 characters. Reissuing the
+    same request at temperature 0 reproduced the same truncation exactly - two model calls, no
+    answer. Room was the missing ingredient.
+    """
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content)["max_tokens"])
+        if len(seen) == 1:
+            return httpx.Response(200, json={"choices": [
+                {"finish_reason": "length", "message": {"content": '{"intent": "task", "task": "sear'}}]})
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(
+            {"intent": "task", "task": "search_patient", "slots": {"name": "walter white"},
+             "clarification": None})}}]})
+
+    engine = MedGemmaNlu(registry, client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    result = await engine.ainterpret("cherche le patient walter white", {})
+
+    assert len(seen) == 2, "the truncated answer was not retried"
+    assert seen[1] > seen[0], f"retried with the same budget that already ran out: {seen}"
+    assert result.task == "search_patient"
+
+
+@pytest.mark.asyncio
+async def test_a_malformed_answer_is_not_retried_with_more_room(registry):
+    """More tokens cannot fix output that was never going to be JSON."""
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content)["max_tokens"])
+        return httpx.Response(200, json={"choices": [
+            {"finish_reason": "stop", "message": {"content": "je ne peux pas repondre"}}]})
+
+    engine = MedGemmaNlu(registry, client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    await engine.ainterpret("cherche le patient walter white", {})
+
+    assert all(budget == seen[0] for budget in seen), f"budget was raised for a malformed answer: {seen}"

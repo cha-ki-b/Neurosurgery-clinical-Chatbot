@@ -1,0 +1,6 @@
+# vLLM's published image does not include the audio extras, so
+# /v1/audio/transcriptions rejects every file with "Invalid or unsupported
+# audio file." librosa + soundfile are what the transcription endpoint uses to
+# decode and resample the upload.
+FROM vllm/vllm-openai:v0.28.0
+RUN pip install --no-cache-dir --break-system-packages librosa soundfile

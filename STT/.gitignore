@@ -1,0 +1,7 @@
+# Recordings and downloaded evaluation audio. Large, regenerable (the public clips) or
+# irreplaceable (clinician recordings) — either way not repository content.
+phase1/audio/
+phase1/dataset-audio/
+phase1/results*.txt
+phase2/results/
+__pycache__/

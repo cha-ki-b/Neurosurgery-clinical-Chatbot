@@ -11,6 +11,7 @@ it does as the clinician whose signed token arrived with the turn.
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from typing import Any, Dict, Optional
 
@@ -21,10 +22,20 @@ from .capabilities import registry as capability_registry
 from .config import settings
 from .orchestrator import Orchestrator
 from .security import ChannelAuthError, TokenError, verify_channel_secret, verify_delegated_token
+from .telemetry import telemetry
 from .tools.catalog import build_registry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
 log = logging.getLogger("clinical-agent")
+
+# httpx logs every request line at INFO, and a patient search URL *is* patient data:
+# `GET /ws/fhir2/R4/Patient?name=Zoubir%20Belkacemi` puts the name a clinician typed straight into
+# this container's logs. Our own log lines were audited and redacted for exactly this (Finding 44);
+# leaving the HTTP client to publish the same values one line later would have made that pointless.
+# Raised to WARNING unless an operator has explicitly turned prompt logging on, in which case they
+# have already accepted PHI in the logs for the length of a debugging session.
+logging.getLogger("httpx").setLevel(logging.INFO if settings.log_prompts else logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 app = FastAPI(
     title="Clinical Agent Service",
@@ -67,6 +78,16 @@ async def on_startup() -> None:
         settings.openmrs_base_url,
         "enabled" if settings.patientview_tools_enabled else "disabled",
     )
+    if settings.log_prompts:
+        # Said once, loudly, at the only moment an operator is watching. LOG_PROMPTS is a
+        # debugging switch and it writes patient data into this container's logs, where it is kept
+        # by the docker log rotation rather than by the hospital's retention policy. The audit
+        # trail on the OpenMRS side already records every prompt under proper access control.
+        log.warning(
+            "LOG_PROMPTS is ON: clinicians' prompts and the values read from them are being "
+            "written to this container's logs. That is patient data outside the OpenMRS audit "
+            "trail. Turn it off once the current diagnosis is finished."
+        )
 
 
 @app.get("/health")
@@ -78,6 +99,20 @@ async def health() -> Dict[str, Any]:
         "fhir_capabilities_known": capabilities.known,
         "fhir_capabilities_error": capabilities.error,
     }
+
+
+@app.get("/metrics")
+async def metrics(
+    channel_key: Optional[str] = Header(default=None, alias="X-Agent-Channel-Key"),
+) -> Dict[str, Any]:
+    """What the assistant has been doing, in counts with no patient data in them.
+
+    Gated on the channel secret for the same reason ``/capabilities`` is: it describes this
+    hospital's use of the system, which is not something to hand to anything that can reach the
+    port.
+    """
+    _require_channel(channel_key)
+    return telemetry.snapshot()
 
 
 @app.get("/capabilities")
@@ -120,6 +155,7 @@ async def chat(
     # Re-read the capability statement when it has gone stale, or was never readable at startup.
     await capability_registry.refresh(delegated_token=payload.delegated_token)
 
+    started = time.monotonic()
     result = await orchestrator.handle_turn(
         prompt=payload.prompt,
         delegated_token=payload.delegated_token,
@@ -127,8 +163,10 @@ async def chat(
         conversation_id=conversation_id,
         context=payload.context.model_dump(),
     )
+    elapsed_ms = (time.monotonic() - started) * 1000
+    telemetry.record_turn(result.task_type, result.state, elapsed_ms)
 
-    log.info("[%s] -> %s (%s)", conversation_id, result.state, result.task_type)
+    log.info("[%s] -> %s (%s) in %dms", conversation_id, result.state, result.task_type, elapsed_ms)
     return result.to_response(conversation_id)
 
 

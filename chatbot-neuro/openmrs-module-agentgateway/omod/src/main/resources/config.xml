@@ -3,7 +3,7 @@
 
     <id>agentgateway</id>
     <name>Clinical Agent Gateway</name>
-    <version>1.1.4</version>
+    <version>1.2.0</version>
     <package>org.openmrs.module.agentgateway</package>
     <author>CERIST / CHU Blida neurosurgery project</author>
     <description>
@@ -37,6 +37,10 @@
     <privilege>
         <name>App: agentgateway.chat.write</name>
         <description>Able to have a confirmed create/update/booking executed on their behalf through the assistant. An extra gate on top of the user's own clinical privileges, never a replacement for them</description>
+    </privilege>
+    <privilege>
+        <name>App: agentgateway.voice.use</name>
+        <description>Able to dictate into the assistant's chat box instead of typing. Separate from chat.use so dictation can be switched off without withdrawing the assistant. Confers only speech-to-text into the compose box; the text is then an ordinary chat turn</description>
     </privilege>
     <privilege>
         <name>App: agentgateway.rollback</name>
@@ -82,6 +86,21 @@
         <property>agentgateway.maxLoggedBodyChars</property>
         <defaultValue>20000</defaultValue>
         <description>Maximum characters of any single request/response body kept in the audit log. Longer bodies are stored truncated with a marker.</description>
+    </globalProperty>
+    <globalProperty>
+        <property>agentgateway.sttServiceUrl</property>
+        <defaultValue>https://stt.hospital.lan</defaultValue>
+        <description>Base URL of the Clinical Dictation Service on Server 2. Server-to-server only; never reachable from a browser.</description>
+    </globalProperty>
+    <globalProperty>
+        <property>agentgateway.sttChannelSecret</property>
+        <defaultValue></defaultValue>
+        <description>Shared secret proving a relayed dictation genuinely came from this OpenMRS instance. Must match STT_CHANNEL_SECRET on the dictation service, and must be a DIFFERENT value from agentgateway.channelSecret - the dictation service refuses any request presenting the chat's secret, and the microphone button stays hidden while this is empty or identical to it.</description>
+    </globalProperty>
+    <globalProperty>
+        <property>agentgateway.sttTimeoutMillis</property>
+        <defaultValue>20000</defaultValue>
+        <description>Connect/read timeout for the relay call to the dictation service, in milliseconds. A 30-second utterance transcribes in well under a second, so this is a stuck-connection backstop.</description>
     </globalProperty>
     <globalProperty>
         <property>agentgateway.signingPrivateKey</property>

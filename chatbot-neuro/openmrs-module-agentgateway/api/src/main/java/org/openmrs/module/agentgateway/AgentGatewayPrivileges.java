@@ -28,6 +28,17 @@ public final class AgentGatewayPrivileges {
 	/** Review the operation log and attempt a rollback. Administrators only. */
 	public static final String ROLLBACK = "App: agentgateway.rollback";
 
+	/**
+	 * Dictate into the chat box instead of typing.
+	 * <p>
+	 * Separate from {@link #CHAT_USE} on purpose: dictation sends audio to a GPU service, and an
+	 * administrator should be able to switch that off - for a ward, for a role, or hospital-wide -
+	 * without taking the assistant away from anyone. It confers nothing beyond turning speech into
+	 * text in the clinician's own compose box; the resulting text is an ordinary chat turn subject
+	 * to every gate that already exists.
+	 */
+	public static final String VOICE_USE = "App: agentgateway.voice.use";
+
 	private AgentGatewayPrivileges() {
 	}
 
@@ -41,6 +52,10 @@ public final class AgentGatewayPrivileges {
 
 	public static void requireRollback() {
 		require(ROLLBACK);
+	}
+
+	public static void requireVoiceUse() {
+		require(VOICE_USE);
 	}
 
 	private static void require(String privilege) {

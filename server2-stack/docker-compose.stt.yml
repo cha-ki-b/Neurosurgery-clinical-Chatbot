@@ -1,0 +1,128 @@
+# Speech-to-text: a security gateway and an ASR engine, on their own network.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.vllm.yml -f docker-compose.stt.yml up -d
+#
+# stt_net is deliberately not server2_net. The clinical agent must not be able to reach
+# the ASR engine, and the STT gateway must not be able to reach MedGemma. "Decoupled"
+# should be true at the packet level, not only on the diagram. nginx is the only
+# container attached to both.
+#
+# Two rules carried over from the rest of this stack, for the same reasons:
+#
+#   * no "ports:" - the model endpoint has NO authentication of any kind. Anything that
+#     could reach a published port could drive it, on the hospital's GPU.
+#   * pinned image tags - "latest" would mean a silent upgrade on some future restart.
+
+services:
+  nginx:
+    environment:
+      # The base file filters to ^(AGENT_|OPENMRS_). Extended here rather than edited
+      # there, so the base stack stays untouched. Without STT_ in the filter,
+      # ${STT_SERVER_NAME} renders empty and the vhost silently answers for nothing -
+      # the trap the server2 README already warns about.
+      NGINX_ENVSUBST_FILTER: "^(AGENT_|OPENMRS_|STT_)"
+      STT_SERVER_NAME: ${STT_SERVER_NAME:?set STT_SERVER_NAME, e.g. stt.hospital.lan}
+      STT_PROXY_READ_TIMEOUT: ${STT_PROXY_READ_TIMEOUT:-30s}
+    volumes:
+      - ./nginx/templates-stt/stt.conf.template:/etc/nginx/templates/stt.conf.template:ro
+    networks:
+      - server2_net
+      - stt_net
+    depends_on:
+      stt-gateway:
+        condition: service_healthy
+
+  stt-gateway:
+    build:
+      context: ../stt-service
+    image: chu-blida/stt-gateway:0.1.0
+    container_name: stt-gateway
+    restart: unless-stopped
+    # .env.stt, NOT .env. `env_file` hands the container the whole file, so sharing .env
+    # gave this service AGENT_CHANNEL_SECRET - defeating the entire reason the two
+    # services have separate secrets (STT-PLAN.md 3/Q2). A service's environment holds
+    # what that service needs and nothing else. See STT/SECURITY-AUDIT.md.
+    env_file: .env.stt
+    environment:
+      STT_ENGINE_URL: http://stt-engine:8000/v1
+    volumes:
+      # The neurosurgery lexicon, read fresh on every request so editing it needs no
+      # restart. Read-only: the service has no business writing to it.
+      - ./stt/lexicon-neurochir.txt:/etc/stt/lexicon-neurochir.txt:ro
+    expose:
+      - "8000"                       # never "ports:"
+    networks:
+      - stt_net
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  stt-engine:
+    # vLLM's published image ships no audio libraries, so /v1/audio/transcriptions
+    # rejects every upload with "Invalid or unsupported audio file" - in 28 ms, too fast
+    # to be the model. This image is that one plus librosa and soundfile. Measured
+    # 2026-09-01; see STT/PHASE-1-SPIKE.md.
+    image: chu-blida/vllm-audio:${STT_VLLM_TAG:-v0.28.0}
+    build:
+      context: ../STT/phase1
+      dockerfile: Dockerfile.spike
+    container_name: stt-engine
+    restart: unless-stopped
+    command:
+      - --model
+      - ${STT_MODEL_PATH:-Qwen/Qwen3-ASR-0.6B}
+      - --served-model-name
+      - ${STT_MODEL:-Qwen3-ASR-0.6B}
+      # DO NOT REMOVE. Qwen3-ASR's own default context is 65,536 tokens, and vLLM refuses
+      # to start unless it can reserve 7 GiB of KV cache for one request that long. The
+      # error reads like "not enough memory", which sends you off lowering
+      # gpu-memory-utilization - the opposite of the fix. 30 s of speech needs nothing
+      # like 8192; the headroom is free.
+      - --max-model-len
+      - "8192"
+      # Floor is ~4.2 GiB, NOT the ~3.3 GiB of weights (2.17) + activation (1.05) +
+      # graphs (0.09). vLLM also demands enough KV cache for one request at the FULL
+      # --max-model-len before it will start: 0.88 GiB at 8192. 0.25 was tried first and
+      # crash-looped on exactly that, with an error that reads like general memory
+      # pressure. 0.30 of 16303 MiB is ~4891 MiB, leaving ~1.5 GiB of KV.
+      - --gpu-memory-utilization
+      - ${STT_GPU_FRACTION:-0.30}
+      - --max-num-seqs
+      - "16"
+    volumes:
+      - ${LLM_MODEL_DIR:-/home/cerist/models}/hf-cache:/root/.cache/huggingface
+    expose:
+      - "8000"                       # no auth on this endpoint - never publish it
+    networks:
+      - stt_net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # Weights load and CUDA graphs capture take about three minutes cold.
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 600s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  stt_net:
+    name: stt_net

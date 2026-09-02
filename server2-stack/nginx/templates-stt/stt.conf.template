@@ -1,0 +1,61 @@
+# The Clinical Dictation Service - a server-to-server vhost, not a browser-facing one.
+#
+# Same posture as agent.conf.template and for the same reason (ADR-12): the browser never
+# talks to Server 2. If it could, the channel secret would have to be reachable from page
+# JavaScript, which means it would not be a secret.
+#
+# Closed to everything except Server 1. That is a third independent layer on top of the
+# channel secret and the signed delegated token: an attacker needs the network position
+# AND this service's own secret AND a token OpenMRS signed with purpose=stt.
+
+server {
+    listen 443 ssl;
+    server_name ${STT_SERVER_NAME};
+
+    include /etc/nginx/snippets/tls.conf;
+    include /etc/nginx/snippets/security-headers.conf;
+
+    access_log /var/log/nginx/stt.access.log server2;
+
+    # Only Server 1.
+    allow ${OPENMRS_SERVER_CIDR};
+    deny all;
+
+    # One whole utterance of raw 16 kHz mono Int16 PCM. The service's own 30 s cap is
+    # 960 KB; 2m leaves margin without letting an unbounded body through. The gateway
+    # enforces the real limit and answers 413 - this is the outer backstop.
+    client_max_body_size 2m;
+
+    location = /v1/transcribe {
+        limit_req zone=stt_transcribe burst=10 nodelay;
+
+        proxy_pass http://stt-gateway:8000/v1/transcribe;
+        include /etc/nginx/snippets/proxy.conf;
+
+        # Raw PCM, already bounded. Buffering keeps a slow client off the GPU rather than
+        # holding an engine slot open while bytes trickle in.
+        proxy_request_buffering on;
+        proxy_read_timeout ${STT_PROXY_READ_TIMEOUT};
+        proxy_send_timeout ${STT_PROXY_READ_TIMEOUT};
+    }
+
+    location = /health {
+        access_log off;
+        proxy_pass http://stt-gateway:8000/health;
+        include /etc/nginx/snippets/proxy.conf;
+    }
+
+    # The service disables FastAPI's /docs, /redoc and /openapi.json itself. This is the
+    # second lock on the same door.
+    location / {
+        return 404;
+    }
+}
+
+# Plain HTTP for this hostname is a misconfiguration, not something to helpfully redirect:
+# a redirect would mean the channel secret had already been sent in clear text.
+server {
+    listen 80;
+    server_name ${STT_SERVER_NAME};
+    return 444;
+}
